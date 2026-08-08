@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Weather Intelligence</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+  <header>
+    <a class="brand" href="/">Weather Intelligence</a>
+    <span class="status"><i></i> Lakebase + pgvector</span>
+  </header>
+  <main>
+    <section class="hero">
+      <p class="eyebrow">SEMANTIC WEATHER RETRIEVAL</p>
+      <h1>Search forecasts by meaning,<br>not only keywords.</h1>
+      <p>Harvest National Weather Service narratives, embed them in Lakebase, and retrieve the passages most relevant to a natural-language question.</p>
+    </section>
+
+    <section class="stats" id="stats">
+      <div><strong>—</strong><span>Documents</span></div>
+      <div><strong>—</strong><span>Embeddings</span></div>
+      <div><strong>—</strong><span>Locations</span></div>
+    </section>
+
+    <section class="workspace">
+      <article class="panel">
+        <div class="step">1</div>
+        <h2>Sync weather documents</h2>
+        <p>Enter one city/state or latitude/longitude per line.</p>
+        <textarea id="locations">{{ default_locations|join('\n') }}</textarea>
+        <label>Maximum documents per location<input id="limit" type="number" min="1" max="200" value="50"></label>
+        <button id="sync">Sync from NWS</button>
+        <pre id="sync-output" class="output" hidden></pre>
+      </article>
+
+      <article class="panel embed-panel">
+        <div class="step">2</div>
+        <h2>Generate embeddings</h2>
+        <p>Open the repository notebook in Databricks after syncing new weather data.</p>
+        <code>notebooks/<br>ingest_weather_embeddings.ipynb</code>
+        <ul>
+          <li>Chunks narrative text</li>
+          <li>Creates 384-dim vectors</li>
+          <li>Writes with psycopg2</li>
+          <li>Verifies vector search</li>
+        </ul>
+        <small>Rerun the notebook after later syncs to embed new or changed documents.</small>
+      </article>
+
+      <article class="panel search-panel">
+        <div class="step">3</div>
+        <h2>Semantic search</h2>
+        <p>After the notebook finishes, search by weather risk or condition.</p>
+        <form id="search-form">
+          <input id="query" required placeholder="flash flood risk this weekend">
+          <div class="row">
+            <select id="source-type"><option value="">All documents</option><option value="alert">Alerts</option><option value="forecast">Forecasts</option></select>
+            <input id="top-k" type="number" min="1" max="20" value="5">
+            <button>Search vectors</button>
+          </div>
+        </form>
+        <div id="results" class="results"><div class="empty">Search results will appear here.</div></div>
+      </article>
+    </section>
+
+    <section class="pipeline">
+      <div><span>1</span><strong>Harvest</strong><small>NWS alerts + forecasts</small></div>
+      <b>→</b><div><span>2</span><strong>Embed</strong><small>384-dim MiniLM vectors</small></div>
+      <b>→</b><div><span>3</span><strong>Retrieve</strong><small>Cosine similarity in pgvector</small></div>
+    </section>
+  </main>
+  <script>
+    const output = document.getElementById('sync-output');
+    const results = document.getElementById('results');
+    async function loadStats() {
+      try {
+        const response = await fetch('/weather/stats');
+        const data = await response.json();
+        const values = [data.documents, data.embeddings, data.locations];
+        document.querySelectorAll('#stats strong').forEach((node, index) => node.textContent = values[index] ?? '—');
+      } catch (_) {}
+    }
+    document.getElementById('sync').addEventListener('click', async () => {
+      output.hidden = false;
+      output.textContent = 'Syncing…';
+      const locations = document.getElementById('locations').value.split('\n').map(v => v.trim()).filter(Boolean);
+      try {
+        const response = await fetch('/weather/sync', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({locations, limit: Number(document.getElementById('limit').value)})});
+        const data = await response.json();
+        output.textContent = JSON.stringify(data, null, 2);
+        loadStats();
+      } catch (error) { output.textContent = error.message; }
+    });
+    document.getElementById('search-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      results.innerHTML = '<div class="empty">Searching…</div>';
+      const payload = {query: document.getElementById('query').value, top_k: Number(document.getElementById('top-k').value)};
+      const source = document.getElementById('source-type').value;
+      if (source) payload.source_type = source;
+      try {
+        const response = await fetch('/weather/search', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Search failed');
+        results.innerHTML = data.matches.map((item, index) => `<article class="result"><header><span>#${index + 1} · ${escapeHtml(item.source_type)}</span><strong>${Number(item.similarity).toFixed(3)}</strong></header><h3>${escapeHtml(item.headline)}</h3><p class="location">${escapeHtml(item.location)}</p><p>${escapeHtml(item.chunk_text)}</p></article>`).join('') || '<div class="empty">No matches.</div>';
+      } catch (error) { results.innerHTML = `<div class="error">${escapeHtml(error.message)}</div>`; }
+    });
+    function escapeHtml(value) { const div = document.createElement('div'); div.textContent = value ?? ''; return div.innerHTML; }
+    loadStats();
+  </script>
+</body>
+</html>
