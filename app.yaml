@@ -1,12 +1,58 @@
+# Databricks App configuration.
+#
+# Deploy this repository as an App from the Databricks UI (Compute -> Apps ->
+# Create app -> deploy from a Git folder), or with the CLI:
+#
+#   databricks apps deploy weather-intelligence \
+#       --source-code-path /Workspace/Users/<you>/homework2-weather-intelligence-app
+#
+# The app's service principal needs READ on the "database" secret scope. Grant
+# it with setup_secrets.py, or:
+#   databricks secrets put-acl database <app-service-principal> READ
+
 command:
   - "python"
   - "app.py"
 
 env:
+  # Where the Lakebase connection URL lives. The value itself is never stored
+  # here -- only the coordinates of the secret that holds it.
   - name: LAKEBASE_SECRET_SCOPE
     value: "database"
   - name: LAKEBASE_SECRET_KEY
     value: "lakebase-url"
-  - name: NWS_USER_AGENT
-    value: "weather-intelligence/1.0 (github.com/shwehan)"
 
+  # The National Weather Service asks every client to identify itself with a
+  # contact address. Change this to a real one before deploying.
+  - name: NWS_USER_AGENT
+    value: "weather-intelligence-app (your.email@example.com)"
+
+  # Lakebase tables. Must match the DDL in sql/.
+  - name: WEATHER_DOCUMENTS_TABLE
+    value: "weather_documents"
+  - name: WEATHER_EMBEDDINGS_TABLE
+    value: "weather_embeddings"
+
+  # Embedding model and chunking. Changing the model means changing the
+  # VECTOR(N) width in sql/03_create_weather_embeddings.sql to match.
+  - name: EMBEDDING_MODEL
+    value: "sentence-transformers/all-MiniLM-L6-v2"
+  - name: CHUNK_SIZE
+    value: "800"
+  - name: CHUNK_OVERLAP
+    value: "100"
+
+  # Load the embedding model on a background thread at startup so the first
+  # search does not pay for it. Set to "false" on a memory-constrained app.
+  - name: PRELOAD_EMBEDDING_MODEL
+    value: "true"
+
+  # Locations used when POST /weather/sync is called with no body.
+  - name: WEATHER_LOCATIONS
+    value: "Chicago, IL;Austin, TX;Denver, CO;Miami, FL;Seattle, WA"
+
+  # Optional: a serving endpoint for the summary on
+  # GET /weather/search?summarize=true. Leave empty to return ranked results
+  # without a written summary.
+  - name: SUMMARY_MODEL_ENDPOINT
+    value: ""

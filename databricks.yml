@@ -1,0 +1,26 @@
+# Databricks Asset Bundle for the weather intelligence project.
+#
+# Deploy:  databricks bundle deploy -t dev
+# Run now: databricks bundle run ingest_weather_embeddings_job -t dev
+#
+# The bundle wires up the scheduled ingestion Job. The Flask app itself is
+# deployed separately as a Databricks App using app.yaml.
+
+bundle:
+  name: weather-intelligence
+
+include:
+  - resources/*.yml
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://<your-workspace>.cloud.databricks.com
+
+  prod:
+    mode: production
+    workspace:
+      host: https://<your-workspace>.cloud.databricks.com
+      root_path: /Shared/.bundle/${bundle.name}/${bundle.target}

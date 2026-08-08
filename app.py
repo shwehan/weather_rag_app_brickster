@@ -1,209 +1,401 @@
-"""Weather Intelligence Flask app: harvest, store, and semantically retrieve."""
+"""
+Weather Intelligence - Flask API and web UI.
+
+Harvests narrative weather text from the National Weather Service, stores it in
+Lakebase (Databricks-managed Postgres), and serves semantic search over the
+resulting pgvector embeddings.
+
+Routes
+    GET  /                     Web UI
+    GET  /healthz              Liveness plus Lakebase reachability
+    GET  /weather/stats        Row counts and coverage
+    POST /weather/sync         Harvest documents for a list of locations
+    POST /weather/embed        Chunk + embed everything not yet vectorized
+    POST /weather/search       Semantic search (JSON body)
+    GET  /weather/search       Semantic search (query string), optional summary
+    GET  /weather/documents    Browse raw synced documents
+
+Run locally:
+    python app.py
+
+Deploy as a Databricks App using app.yaml.
+"""
+
+from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timezone
+import threading
 
-from dotenv import load_dotenv
+import requests
+from psycopg2 import errors as pg_errors
 from flask import Flask, jsonify, render_template, request
+
+import config
+import embedding_pipeline
 import lakebase
-from embedding_model import MODEL_NAME, embed_texts, vector_literal
-from weather_client import WeatherClient, WeatherClientError
-from weather_store import upsert_weather_documents
+from weather_client import (
+    SOURCE_TYPE_ALERT,
+    SOURCE_TYPE_FORECAST,
+    LocationResolutionError,
+    WeatherClient,
+)
 
-
-load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("weather-intelligence")
 
 app = Flask(__name__)
 
-DEFAULT_LOCATIONS = [
-    value.strip()
-    for value in os.environ.get("WEATHER_LOCATIONS", "Chicago, IL;Austin, TX").split(";")
-    if value.strip()
-]
+VALID_SOURCE_TYPES = {SOURCE_TYPE_ALERT, SOURCE_TYPE_FORECAST}
+
+_SETUP_HINT = (
+    "Run the scripts in sql/ against your Lakebase database to create "
+    "weather_documents and weather_embeddings before using this endpoint."
+)
+
+
+def _preload_model() -> None:
+    """Warm the sentence-transformers model once, off the request path.
+
+    The model is loaded exactly once per process. Doing it on a background
+    thread at startup means the first search is fast without delaying the
+    health check while the weights download.
+    """
+    try:
+        embedding_pipeline.get_model()
+        logger.info("Embedding model ready: %s", config.EMBEDDING_MODEL_NAME)
+    except Exception:
+        # A cold model is not fatal -- the first search will retry the load
+        # and surface any real problem to the caller.
+        logger.exception("Could not preload the embedding model at startup")
+
+
+if os.environ.get("PRELOAD_EMBEDDING_MODEL", "true").lower() != "false":
+    threading.Thread(target=_preload_model, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Error handling
+# ---------------------------------------------------------------------------
 
 
 @app.errorhandler(Exception)
-def handle_unexpected_error(error):
-    logger.exception("Unhandled application error")
-    status = getattr(error, "code", 500)
-    return jsonify({"error": str(error)}), status if isinstance(status, int) else 500
+def handle_exception(err):
+    """Always answer with JSON so the UI's fetch().json() never sees HTML."""
+    status = getattr(err, "code", 500)
+    if not isinstance(status, int):
+        status = 500
+
+    if isinstance(err, pg_errors.UndefinedTable):
+        return jsonify({"error": "Table not found. " + _SETUP_HINT}), 503
+
+    logger.exception("Unhandled error while processing %s", request.path)
+    return jsonify({"error": str(err)}), status
 
 
-@app.get("/")
+def _json_body() -> dict:
+    return request.get_json(silent=True) or {}
+
+
+def _clamp_top_k(value) -> int:
+    try:
+        top_k = int(value)
+    except (TypeError, ValueError):
+        top_k = config.DEFAULT_TOP_K
+    return max(config.MIN_TOP_K, min(top_k, config.MAX_TOP_K))
+
+
+def _clean_source_type(value) -> str | None:
+    if not value:
+        return None
+    value = str(value).strip().lower()
+    if value in ("", "all", "any"):
+        return None
+    if value not in VALID_SOURCE_TYPES:
+        raise ValueError(
+            f"source_type must be one of {sorted(VALID_SOURCE_TYPES)} or omitted."
+        )
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Pages and health
+# ---------------------------------------------------------------------------
+
+
+@app.route("/")
 def index():
-    return render_template("index.html", default_locations=DEFAULT_LOCATIONS)
+    return render_template("index.html")
 
 
-@app.get("/healthz")
+@app.route("/healthz")
 def healthz():
+    payload = {"status": "ok", "model": config.EMBEDDING_MODEL_NAME}
+    try:
+        payload["lakebase"] = lakebase.ping()
+        payload["tables"] = {
+            config.WEATHER_DOCUMENTS_TABLE: lakebase.table_exists(
+                config.WEATHER_DOCUMENTS_TABLE
+            ),
+            config.WEATHER_EMBEDDINGS_TABLE: lakebase.table_exists(
+                config.WEATHER_EMBEDDINGS_TABLE
+            ),
+        }
+    except Exception as exc:
+        payload["status"] = "degraded"
+        payload["error"] = str(exc)
+        return jsonify(payload), 503
+    return jsonify(payload)
+
+
+@app.route("/weather/stats")
+def weather_stats():
+    return jsonify(embedding_pipeline.stats())
+
+
+# ---------------------------------------------------------------------------
+# Part 1 - harvest
+# ---------------------------------------------------------------------------
+
+
+@app.route("/weather/sync", methods=["POST"])
+def weather_sync():
+    """Harvest alerts and forecasts for a list of locations into Lakebase.
+
+    Body: {"locations": ["Chicago, IL", "Austin, TX"], "limit": 50,
+           "include_alerts": true, "include_forecast": true}
+    """
+    body = _json_body()
+
+    locations = body.get("locations") or config.DEFAULT_LOCATIONS
+    if isinstance(locations, str):
+        locations = [part for part in locations.split(";") if part.strip()]
+    locations = [
+        loc.strip() for loc in locations if isinstance(loc, str) and loc.strip()
+    ]
+    if not locations:
+        return jsonify({"error": "Provide at least one location."}), 400
+    if len(locations) > 25:
+        return jsonify({"error": "Sync at most 25 locations per request."}), 400
+
+    try:
+        limit = max(1, min(int(body.get("limit", config.DEFAULT_SYNC_LIMIT)), 200))
+    except (TypeError, ValueError):
+        return jsonify({"error": "limit must be an integer."}), 400
+
+    include_alerts = bool(body.get("include_alerts", True))
+    include_forecast = bool(body.get("include_forecast", True))
+    if not (include_alerts or include_forecast):
+        return jsonify(
+            {"error": "Enable at least one of include_alerts or include_forecast."}
+        ), 400
+
+    client = WeatherClient()
+    try:
+        documents, errors = client.fetch_documents(
+            locations,
+            limit=limit,
+            include_alerts=include_alerts,
+            include_forecast=include_forecast,
+        )
+    except requests.RequestException as exc:
+        return jsonify({"error": f"National Weather Service request failed: {exc}"}), 502
+    except LocationResolutionError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    synced = embedding_pipeline.upsert_documents(documents)
+
     return jsonify(
         {
-            "status": "ok",
-            "model": MODEL_NAME,
-            "time": datetime.now(timezone.utc).isoformat(),
+            "synced": synced,
+            "alerts": sum(1 for d in documents if d["source_type"] == SOURCE_TYPE_ALERT),
+            "forecasts": sum(
+                1 for d in documents if d["source_type"] == SOURCE_TYPE_FORECAST
+            ),
+            "locations": locations,
+            "errors": errors,
         }
     )
 
 
-@app.get("/weather/stats")
-def weather_stats():
-    lakebase.ensure_weather_schema()
-    rows = lakebase.run_query(
-        """
-        SELECT
-            (SELECT COUNT(*) FROM weather_documents) AS documents,
-            (SELECT COUNT(*) FROM weather_embeddings) AS embeddings,
-            (SELECT COUNT(DISTINCT location) FROM weather_documents) AS locations,
-            (SELECT MAX(synced_at) FROM weather_documents) AS last_synced_at
-        """
-    )
-    return jsonify(rows[0])
-
-
-@app.post("/weather/sync")
-def sync_weather():
-    """Fetch NWS alerts and forecasts and upsert normalized documents."""
-    body = request.get_json(silent=True) or {}
-    locations = body.get("locations") or DEFAULT_LOCATIONS
-    if not isinstance(locations, list) or not locations:
-        return jsonify({"error": "locations must be a non-empty list"}), 400
-    if len(locations) > 20:
-        return jsonify({"error": "A sync request supports at most 20 locations"}), 400
-
+@app.route("/weather/documents")
+def weather_documents():
+    """Browse the raw synced documents, newest first."""
+    limit = max(1, min(int(request.args.get("limit", 25)), 200))
     try:
-        limit = max(1, min(int(body.get("limit", 50)), 200))
-    except (TypeError, ValueError):
-        return jsonify({"error": "limit must be an integer between 1 and 200"}), 400
+        source_type = _clean_source_type(request.args.get("source_type"))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
-    lakebase.ensure_weather_schema()
-    client = WeatherClient()
-    total = 0
-    results = []
-    errors = []
-
-    for requested_location in locations:
-        try:
-            documents = client.fetch_documents(requested_location, limit=limit)
-            synced = upsert_weather_documents(documents)
-            total += synced
-            results.append(
-                {
-                    "requested_location": requested_location,
-                    "documents_synced": synced,
-                }
-            )
-        except (WeatherClientError, ValueError) as exc:
-            errors.append(
-                {"requested_location": requested_location, "error": str(exc)}
-            )
-
-    status = 200 if results else 502
-    return (
-        jsonify(
-            {
-                "synced": total,
-                "locations": results,
-                "errors": errors,
-                "next_step": "Run notebooks/ingest_weather_embeddings.ipynb to embed new or changed documents.",
-            }
-        ),
-        status,
-    )
-
-
-@app.route("/weather/search", methods=["GET", "POST"])
-def search_weather():
-    """Return weather chunks ranked by pgvector cosine similarity."""
-    if request.method == "POST":
-        body = request.get_json(silent=True) or {}
-        query = body.get("query", "")
-        requested_top_k = body.get("top_k", 5)
-        source_type = body.get("source_type")
-    else:
-        query = request.args.get("query", "")
-        requested_top_k = request.args.get("top_k", 5)
-        source_type = request.args.get("source_type")
-
-    query = query.strip() if isinstance(query, str) else ""
-    if not query:
-        return jsonify({"error": "query must be a non-empty string"}), 400
-    if len(query) > 1000:
-        return jsonify({"error": "query must be 1000 characters or fewer"}), 400
-
-    try:
-        top_k = max(1, min(int(requested_top_k), 20))
-    except (TypeError, ValueError):
-        return jsonify({"error": "top_k must be an integer"}), 400
-
-    if source_type not in (None, "", "alert", "forecast"):
-        return jsonify({"error": "source_type must be alert or forecast"}), 400
-
-    lakebase.ensure_weather_schema()
-    count = lakebase.run_query("SELECT COUNT(*) AS count FROM weather_embeddings")[0][
-        "count"
-    ]
-    if count == 0:
-        return (
-            jsonify(
-                {
-                    "error": "No weather embeddings are available yet.",
-                    "next_step": "Sync documents, then run notebooks/ingest_weather_embeddings.ipynb",
-                }
-            ),
-            409,
-        )
-
-    query_vector = vector_literal(embed_texts([query])[0])
-    source_clause = "AND d.source_type = %s" if source_type else ""
-    params = [query_vector]
+    sql = f"""
+        SELECT id, location, source_type, event, headline, severity,
+               left(narrative_text, 400) AS narrative_preview,
+               effective_at, expires_at, synced_at
+        FROM {config.WEATHER_DOCUMENTS_TABLE}
+    """
+    params: list = []
     if source_type:
+        sql += " WHERE source_type = %s"
         params.append(source_type)
-    params.extend([query_vector, top_k])
+    sql += " ORDER BY synced_at DESC, effective_at DESC NULLS LAST LIMIT %s"
+    params.append(limit)
 
-    rows = lakebase.run_query(
-        f"""
-        SELECT
-            d.id,
-            d.location,
-            d.source_type,
-            d.headline,
-            d.narrative_text,
-            d.issued_at,
-            d.effective_at,
-            e.chunk_index,
-            e.chunk_text,
-            1 - (e.embedding <=> %s::vector) AS similarity
-        FROM weather_embeddings AS e
-        JOIN weather_documents AS d ON d.id = e.document_id
-        WHERE TRUE {source_clause}
-        ORDER BY e.embedding <=> %s::vector
-        LIMIT %s
-        """,
-        tuple(params),
-    )
-    matches = []
+    rows = lakebase.run_query(sql, tuple(params))
     for row in rows:
-        match = dict(row)
-        match["similarity"] = round(float(match["similarity"]), 6)
-        matches.append(match)
+        for key in ("effective_at", "expires_at", "synced_at"):
+            if row.get(key) is not None:
+                row[key] = row[key].isoformat()
+    return jsonify({"documents": rows, "count": len(rows)})
 
-    return jsonify(
-        {
+
+# ---------------------------------------------------------------------------
+# Part 2 - vectorize
+# ---------------------------------------------------------------------------
+
+
+@app.route("/weather/embed", methods=["POST"])
+def weather_embed():
+    """Chunk and embed every document that has no current vector.
+
+    The notebook is the primary place to run this, but exposing it here keeps
+    the web demo self-contained: sync, embed, then search without leaving the
+    page.
+    """
+    body = _json_body()
+    limit = body.get("limit")
+    if limit is not None:
+        try:
+            limit = max(1, min(int(limit), 5000))
+        except (TypeError, ValueError):
+            return jsonify({"error": "limit must be an integer."}), 400
+
+    result = embedding_pipeline.embed_pending_documents(limit=limit)
+    return jsonify(result)
+
+
+# ---------------------------------------------------------------------------
+# Part 3 - retrieve
+# ---------------------------------------------------------------------------
+
+
+def _run_search(query: str, top_k: int, source_type: str | None):
+    """Shared search body for the GET and POST variants."""
+    if not query or not query.strip():
+        return None, (jsonify({"error": "Provide a non-empty 'query'."}), 400)
+
+    if not lakebase.table_exists(config.WEATHER_EMBEDDINGS_TABLE):
+        return None, (jsonify({"error": "No embeddings table. " + _SETUP_HINT}), 503)
+
+    results = embedding_pipeline.search(
+        query, top_k=top_k, source_type=source_type
+    )
+
+    if not results:
+        return {
             "query": query,
             "top_k": top_k,
-            "source_type": source_type or "all",
-            "model": MODEL_NAME,
-            "matches": matches,
-        }
+            "source_type": source_type,
+            "results": [],
+            "message": (
+                "No weather documents have been embedded yet. Sync some "
+                "locations, then run the embedding step."
+            ),
+        }, None
+
+    return {
+        "query": query,
+        "top_k": top_k,
+        "source_type": source_type,
+        "results": results,
+    }, None
+
+
+@app.route("/weather/search", methods=["POST"])
+def weather_search():
+    """Semantic search over ingested weather documents.
+
+    Body: {"query": "flash flood risk this weekend", "top_k": 5,
+           "source_type": "alert"}
+    """
+    body = _json_body()
+    try:
+        source_type = _clean_source_type(body.get("source_type"))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    payload, error = _run_search(
+        body.get("query", ""), _clamp_top_k(body.get("top_k")), source_type
     )
+    if error:
+        return error
+    return jsonify(payload)
+
+
+@app.route("/weather/search", methods=["GET"])
+def weather_search_get():
+    """Query-string variant, with an optional generated summary of the hits."""
+    try:
+        source_type = _clean_source_type(request.args.get("source_type"))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    payload, error = _run_search(
+        request.args.get("query", ""),
+        _clamp_top_k(request.args.get("top_k")),
+        source_type,
+    )
+    if error:
+        return error
+
+    wants_summary = request.args.get("summarize", "").lower() in ("1", "true", "yes")
+    if wants_summary and payload["results"]:
+        payload["summary"] = _summarize(payload["query"], payload["results"])
+
+    return jsonify(payload)
+
+
+def _summarize(query: str, results: list[dict]) -> str:
+    """Ask a Databricks serving endpoint to summarize the retrieved chunks.
+
+    This is the generation half of retrieval-augmented generation. It is
+    optional: without SUMMARY_MODEL_ENDPOINT configured, search still returns
+    ranked results and the caller just gets a note instead of a summary.
+    """
+    if not config.SUMMARY_ENDPOINT:
+        return (
+            "Set SUMMARY_MODEL_ENDPOINT to a Databricks serving endpoint to get "
+            "a written summary alongside these results."
+        )
+
+    context = "\n\n".join(
+        f"[{i + 1}] {row['location']} - {row['headline']}\n{row['chunk_text']}"
+        for i, row in enumerate(results)
+    )
+    prompt = (
+        "You are a weather briefing assistant. Using only the numbered weather "
+        f"excerpts below, answer the question: {query}\n\n"
+        "Be specific about locations and timing, cite excerpts as [1], [2], and "
+        "say so plainly if the excerpts do not cover the question.\n\n"
+        f"{context}"
+    )
+
+    try:
+        from databricks.sdk import WorkspaceClient
+        from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
+
+        response = WorkspaceClient().serving_endpoints.query(
+            name=config.SUMMARY_ENDPOINT,
+            messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
+            max_tokens=400,
+        )
+        return response.choices[0].message.content
+    except Exception as exc:
+        logger.warning("Summary generation failed: %s", exc)
+        return f"Summary unavailable: {exc}"
 
 
 if __name__ == "__main__":
-    lakebase.ensure_weather_schema()
-    app.run(
-        host="0.0.0.0",
-        port=int(os.environ.get("DATABRICKS_APP_PORT", "8000")),
-    )
+    host = os.getenv("FLASK_RUN_HOST", "0.0.0.0")
+    port = int(os.getenv("FLASK_RUN_PORT", "8000"))
+    app.run(debug=os.getenv("FLASK_DEBUG", "false").lower() == "true",
+            host=host, port=port)

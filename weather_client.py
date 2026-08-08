@@ -1,241 +1,455 @@
-"""National Weather Service client and weather-document normalizer."""
+"""
+Client for the National Weather Service API (https://api.weather.gov).
+
+The NWS API needs no key and no auth plumbing, so this module is purely about
+turning locations into documents:
+
+    "Chicago, IL"  ->  (41.8781, -87.6298)          resolve_location()
+                   ->  grid point LOT/75,73          resolve_grid_point()
+                   ->  active alerts + 7-day forecast
+                   ->  normalized document records   fetch_documents()
+
+Every document that comes out of :meth:`WeatherClient.fetch_documents` has the
+same shape regardless of whether it started life as an alert or a forecast
+period, which is what lets one embedding pipeline and one retrieval endpoint
+serve both.
+
+The NWS terms of service ask every client to identify itself in the
+``User-Agent`` header with a contact address. Set ``NWS_USER_AGENT`` to
+something like ``"weather-intelligence-app (you@example.com)"``.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import os
 import re
-from dataclasses import dataclass
-from typing import Any
+import time
+from datetime import datetime, timezone
+from typing import Any, Iterable
 
 import requests
 
+NWS_API_BASE_URL = os.environ.get("NWS_API_BASE_URL", "https://api.weather.gov")
 
-NWS_BASE_URL = os.environ.get("NWS_BASE_URL", "https://api.weather.gov")
-GEOCODER_BASE_URL = os.environ.get(
-    "GEOCODER_BASE_URL", "https://geocoding-api.open-meteo.com/v1"
+DEFAULT_USER_AGENT = os.environ.get(
+    "NWS_USER_AGENT", "weather-intelligence-app (contact: set NWS_USER_AGENT)"
 )
+
+# The NWS asks for "a few requests per second" at most. One resolve + one
+# alerts + one forecast call per location is already modest, but a small
+# delay keeps bulk syncs comfortably inside the guidance.
+DEFAULT_REQUEST_DELAY_SECONDS = float(os.environ.get("NWS_REQUEST_DELAY", "0.2"))
 DEFAULT_TIMEOUT = 30
-COORDINATE_RE = re.compile(
-    r"^\s*(-?(?:\d+(?:\.\d+)?|\.\d+))\s*,\s*"
-    r"(-?(?:\d+(?:\.\d+)?|\.\d+))\s*$"
+
+SOURCE_TYPE_ALERT = "alert"
+SOURCE_TYPE_FORECAST = "forecast"
+
+# A "City, ST" string has no meaning to the NWS API, which only speaks
+# latitude/longitude. This table covers the metro areas most likely to be
+# used in a demo so the pipeline runs with zero external geocoding. Anything
+# not listed here falls back to the free U.S. Census geocoder, and raw
+# "lat,lon" input always works.
+US_CITY_COORDINATES: dict[str, tuple[float, float]] = {
+    "albuquerque, nm": (35.0844, -106.6504),
+    "anchorage, ak": (61.2181, -149.9003),
+    "atlanta, ga": (33.7490, -84.3880),
+    "austin, tx": (30.2672, -97.7431),
+    "baltimore, md": (39.2904, -76.6122),
+    "billings, mt": (45.7833, -108.5007),
+    "birmingham, al": (33.5186, -86.8104),
+    "boise, id": (43.6150, -116.2023),
+    "boston, ma": (42.3601, -71.0589),
+    "buffalo, ny": (42.8864, -78.8784),
+    "burlington, vt": (44.4759, -73.2121),
+    "charleston, sc": (32.7765, -79.9311),
+    "charlotte, nc": (35.2271, -80.8431),
+    "cheyenne, wy": (41.1400, -104.8202),
+    "chicago, il": (41.8781, -87.6298),
+    "cincinnati, oh": (39.1031, -84.5120),
+    "cleveland, oh": (41.4993, -81.6944),
+    "columbus, oh": (39.9612, -82.9988),
+    "dallas, tx": (32.7767, -96.7970),
+    "denver, co": (39.7392, -104.9903),
+    "des moines, ia": (41.5868, -93.6250),
+    "detroit, mi": (42.3314, -83.0458),
+    "fargo, nd": (46.8772, -96.7898),
+    "hartford, ct": (41.7658, -72.6734),
+    "honolulu, hi": (21.3069, -157.8583),
+    "houston, tx": (29.7604, -95.3698),
+    "indianapolis, in": (39.7684, -86.1581),
+    "jackson, ms": (32.2988, -90.1848),
+    "jacksonville, fl": (30.3322, -81.6557),
+    "kansas city, mo": (39.0997, -94.5786),
+    "las vegas, nv": (36.1699, -115.1398),
+    "little rock, ar": (34.7465, -92.2896),
+    "los angeles, ca": (34.0522, -118.2437),
+    "louisville, ky": (38.2527, -85.7585),
+    "memphis, tn": (35.1495, -90.0490),
+    "miami, fl": (25.7617, -80.1918),
+    "milwaukee, wi": (43.0389, -87.9065),
+    "minneapolis, mn": (44.9778, -93.2650),
+    "nashville, tn": (36.1627, -86.7816),
+    "new orleans, la": (29.9511, -90.0715),
+    "new york, ny": (40.7128, -74.0060),
+    "norfolk, va": (36.8508, -76.2859),
+    "oklahoma city, ok": (35.4676, -97.5164),
+    "omaha, ne": (41.2565, -95.9345),
+    "orlando, fl": (28.5383, -81.3792),
+    "philadelphia, pa": (39.9526, -75.1652),
+    "phoenix, az": (33.4484, -112.0740),
+    "pittsburgh, pa": (40.4406, -79.9959),
+    "portland, me": (43.6591, -70.2568),
+    "portland, or": (45.5152, -122.6784),
+    "providence, ri": (41.8240, -71.4128),
+    "raleigh, nc": (35.7796, -78.6382),
+    "reno, nv": (39.5296, -119.8138),
+    "richmond, va": (37.5407, -77.4360),
+    "sacramento, ca": (38.5816, -121.4944),
+    "salt lake city, ut": (40.7608, -111.8910),
+    "san antonio, tx": (29.4241, -98.4936),
+    "san diego, ca": (32.7157, -117.1611),
+    "san francisco, ca": (37.7749, -122.4194),
+    "seattle, wa": (47.6062, -122.3321),
+    "sioux falls, sd": (43.5460, -96.7313),
+    "spokane, wa": (47.6588, -117.4260),
+    "st. louis, mo": (38.6270, -90.1994),
+    "tampa, fl": (27.9506, -82.4572),
+    "tulsa, ok": (36.1540, -95.9928),
+    "washington, dc": (38.9072, -77.0369),
+    "wichita, ks": (37.6872, -97.3301),
+}
+
+_LAT_LON_RE = re.compile(
+    r"^\s*(-?\d{1,3}(?:\.\d+)?)\s*[,/ ]\s*(-?\d{1,3}(?:\.\d+)?)\s*$"
+)
+
+_CENSUS_GEOCODER_URL = (
+    "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress"
 )
 
 
-class WeatherClientError(RuntimeError):
-    """Raised when a location or upstream weather request cannot be resolved."""
+class LocationResolutionError(ValueError):
+    """Raised when a location string cannot be turned into coordinates."""
 
 
-@dataclass(frozen=True)
-class Location:
-    label: str
-    latitude: float
-    longitude: float
+def content_hash(text: str) -> str:
+    """Stable hash of a narrative, used to detect re-issued/updated text.
+
+    Alerts get updated and forecasts get re-issued several times a day. The
+    hash lets the embedding job re-embed a document only when its text has
+    actually changed, instead of every time it is re-synced.
+    """
+    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+
+
+def _slugify(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")
+
+
+def _parse_timestamp(value: str | None) -> str | None:
+    """Normalize an NWS ISO-8601 timestamp to UTC, or return None."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
 
 
 class WeatherClient:
+    """Thin, retry-friendly wrapper around the National Weather Service API."""
+
     def __init__(
         self,
-        nws_base_url: str | None = None,
-        geocoder_base_url: str | None = None,
+        base_url: str | None = None,
+        user_agent: str | None = None,
         timeout: int = DEFAULT_TIMEOUT,
-        session: requests.Session | None = None,
+        request_delay: float = DEFAULT_REQUEST_DELAY_SECONDS,
     ):
-        self.nws_base_url = (nws_base_url or NWS_BASE_URL).rstrip("/")
-        self.geocoder_base_url = (geocoder_base_url or GEOCODER_BASE_URL).rstrip("/")
+        self.base_url = (base_url or NWS_API_BASE_URL).rstrip("/")
         self.timeout = timeout
-        self.session = session or requests.Session()
-        self.session.headers.update(
+        self.request_delay = request_delay
+        self._session = requests.Session()
+        self._session.headers.update(
             {
-                "User-Agent": os.environ.get(
-                    "NWS_USER_AGENT",
-                    "weather-intelligence/1.0 (github.com/shwehan)",
-                ),
-                "Accept": "application/geo+json, application/json",
+                "User-Agent": user_agent or DEFAULT_USER_AGENT,
+                "Accept": "application/geo+json",
             }
         )
+        self._last_request_at = 0.0
 
-    def _get(self, url: str, params: dict[str, Any] | None = None) -> dict:
-        try:
-            response = self.session.get(url, params=params, timeout=self.timeout)
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException as exc:
-            raise WeatherClientError(f"Upstream request failed: {exc}") from exc
-        except ValueError as exc:
-            raise WeatherClientError("Upstream service returned invalid JSON") from exc
+    # -- HTTP ------------------------------------------------------------
 
-    def resolve_location(self, value: str | dict[str, Any]) -> Location:
-        """Resolve `lat,lon`, a mapping, or a city/state string to coordinates."""
-        if isinstance(value, dict):
-            try:
-                latitude = float(value["latitude"])
-                longitude = float(value["longitude"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise WeatherClientError(
-                    "Location objects require numeric latitude and longitude"
-                ) from exc
-            label = str(value.get("label") or f"{latitude:.4f},{longitude:.4f}").strip()
-            return self._validated_location(label, latitude, longitude)
+    def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        """GET a path on the NWS API and return the decoded JSON body."""
+        elapsed = time.monotonic() - self._last_request_at
+        if elapsed < self.request_delay:
+            time.sleep(self.request_delay - elapsed)
 
-        if not isinstance(value, str) or not value.strip():
-            raise WeatherClientError("Locations must be non-empty strings or objects")
+        resp = self._session.get(
+            f"{self.base_url}{path}", params=params, timeout=self.timeout
+        )
+        self._last_request_at = time.monotonic()
+        resp.raise_for_status()
+        return resp.json()
 
-        raw = value.strip()
-        match = COORDINATE_RE.match(raw)
+    # -- Location resolution ---------------------------------------------
+
+    def resolve_location(self, location: str) -> tuple[float, float]:
+        """Turn a location string into ``(latitude, longitude)``.
+
+        Accepts a raw ``"41.88,-87.63"`` pair, a city in the built-in table,
+        or anything the U.S. Census geocoder understands.
+        """
+        if not isinstance(location, str) or not location.strip():
+            raise LocationResolutionError("Location must be a non-empty string.")
+
+        raw = location.strip()
+
+        match = _LAT_LON_RE.match(raw)
         if match:
-            return self._validated_location(raw, float(match.group(1)), float(match.group(2)))
-
-        # NWS needs coordinates. Open-Meteo is used only for place-name geocoding;
-        # all weather text still comes from api.weather.gov.
-        data = self._get(
-            f"{self.geocoder_base_url}/search",
-            params={
-                "name": raw,
-                "count": 10,
-                "language": "en",
-                "format": "json",
-                "countryCode": "US",
-            },
-        )
-        results = data.get("results") or []
-        if not results:
-            raise WeatherClientError(f"Could not resolve U.S. location: {raw}")
-
-        best = self._best_geocoder_match(raw, results)
-        label_parts = [best.get("name"), best.get("admin1")]
-        label = ", ".join(str(part) for part in label_parts if part) or raw
-        return self._validated_location(
-            label, float(best["latitude"]), float(best["longitude"])
-        )
-
-    @staticmethod
-    def _best_geocoder_match(query: str, results: list[dict]) -> dict:
-        """Prefer an exact state match for inputs such as `Chicago, IL`."""
-        parts = [part.strip().lower() for part in query.split(",")]
-        if len(parts) < 2:
-            return results[0]
-        state_query = parts[-1]
-        for result in results:
-            admin = str(result.get("admin1") or "").lower()
-            admin_code = str(result.get("admin1_code") or "").lower()
-            if state_query in {admin, admin_code}:
-                return result
-        return results[0]
-
-    @staticmethod
-    def _validated_location(label: str, latitude: float, longitude: float) -> Location:
-        if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
-            raise WeatherClientError("Latitude or longitude is out of range")
-        return Location(label=label[:200], latitude=latitude, longitude=longitude)
-
-    def fetch_documents(self, value: str | dict[str, Any], limit: int = 50) -> list[dict]:
-        """Fetch active alerts and multi-day forecast narratives for one location."""
-        location = self.resolve_location(value)
-        point = f"{location.latitude:.4f},{location.longitude:.4f}"
-        point_data = self._get(f"{self.nws_base_url}/points/{point}")
-        point_properties = point_data.get("properties") or {}
-        forecast_url = point_properties.get("forecast")
-        if not forecast_url:
-            raise WeatherClientError(f"NWS returned no forecast URL for {location.label}")
-
-        alerts_data = self._get(
-            f"{self.nws_base_url}/alerts/active", params={"point": point}
-        )
-        forecast_data = self._get(forecast_url)
-
-        documents = self._normalize_alerts(location, alerts_data)
-        documents.extend(self._normalize_forecast(location, forecast_url, forecast_data))
-        return documents[: max(1, min(int(limit), 200))]
-
-    def _normalize_alerts(self, location: Location, data: dict) -> list[dict]:
-        documents = []
-        for feature in data.get("features") or []:
-            props = feature.get("properties") or {}
-            description = (props.get("description") or "").strip()
-            instruction = (props.get("instruction") or "").strip()
-            narrative = "\n\n".join(part for part in (description, instruction) if part)
-            if not narrative:
-                continue
-            upstream_id = str(feature.get("id") or props.get("id") or "")
-            stable_id = self._stable_id(
-                "alert", location.label, upstream_id or hashlib.sha256(narrative.encode()).hexdigest()
-            )
-            documents.append(
-                self._document(
-                    stable_id=stable_id,
-                    location=location,
-                    source_type="alert",
-                    headline=props.get("headline") or props.get("event") or "Weather alert",
-                    narrative=narrative,
-                    issued_at=props.get("sent") or props.get("onset"),
-                    effective_at=props.get("effective") or props.get("onset"),
-                    payload=feature,
+            lat, lon = float(match.group(1)), float(match.group(2))
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                raise LocationResolutionError(
+                    f"Coordinates out of range: {raw!r}"
                 )
-            )
-        return documents
+            return lat, lon
 
-    def _normalize_forecast(
-        self, location: Location, forecast_url: str, data: dict
-    ) -> list[dict]:
-        documents = []
-        periods = (data.get("properties") or {}).get("periods") or []
-        for period in periods:
-            narrative = (period.get("detailedForecast") or "").strip()
-            if not narrative:
-                continue
-            issued_at = (data.get("properties") or {}).get("generatedAt")
-            effective_at = period.get("startTime")
-            upstream_key = "|".join(
-                [forecast_url, str(period.get("number")), str(effective_at)]
-            )
-            headline = " — ".join(
-                part
-                for part in (period.get("name"), period.get("shortForecast"))
-                if part
-            ) or "Weather forecast"
-            documents.append(
-                self._document(
-                    stable_id=self._stable_id("forecast", location.label, upstream_key),
-                    location=location,
-                    source_type="forecast",
-                    headline=headline,
-                    narrative=narrative,
-                    issued_at=issued_at,
-                    effective_at=effective_at,
-                    payload=period,
-                )
-            )
-        return documents
+        key = re.sub(r"\s+", " ", raw.lower())
+        if key in US_CITY_COORDINATES:
+            return US_CITY_COORDINATES[key]
 
-    @staticmethod
-    def _stable_id(*parts: str) -> str:
-        digest = hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
-        return f"weather:{digest}"
+        coords = self._geocode_with_census(raw)
+        if coords is None:
+            raise LocationResolutionError(
+                f"Could not resolve {raw!r}. Use 'City, ST' for a U.S. city or "
+                "a 'latitude,longitude' pair."
+            )
+        return coords
 
-    @staticmethod
-    def _document(
-        *,
-        stable_id: str,
-        location: Location,
-        source_type: str,
-        headline: str,
-        narrative: str,
-        issued_at: str | None,
-        effective_at: str | None,
-        payload: dict,
-    ) -> dict:
-        content_hash = hashlib.sha256(narrative.encode("utf-8")).hexdigest()
+    def _geocode_with_census(self, address: str) -> tuple[float, float] | None:
+        """Best-effort lookup against the free U.S. Census geocoder."""
+        try:
+            resp = self._session.get(
+                _CENSUS_GEOCODER_URL,
+                params={
+                    "address": address,
+                    "benchmark": "Public_AR_Current",
+                    "format": "json",
+                },
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            matches = (
+                resp.json().get("result", {}).get("addressMatches", []) or []
+            )
+        except (requests.RequestException, ValueError):
+            return None
+
+        if not matches:
+            return None
+        coordinates = matches[0].get("coordinates") or {}
+        lat, lon = coordinates.get("y"), coordinates.get("x")
+        if lat is None or lon is None:
+            return None
+        return float(lat), float(lon)
+
+    def resolve_grid_point(self, latitude: float, longitude: float) -> dict:
+        """Resolve coordinates to an NWS forecast office and grid cell.
+
+        ``GET /points/{lat},{lon}`` is the entry point for every gridded
+        product. It also hands back the nearest named place, which is what we
+        store as the canonical ``location`` label.
+        """
+        data = self.get(f"/points/{latitude:.4f},{longitude:.4f}")
+        props = data.get("properties", {}) or {}
+        relative = (props.get("relativeLocation") or {}).get("properties") or {}
+
+        city, state = relative.get("city"), relative.get("state")
+        label = f"{city}, {state}" if city and state else f"{latitude:.4f},{longitude:.4f}"
+
         return {
-            "id": stable_id,
-            "location": location.label,
-            "latitude": location.latitude,
-            "longitude": location.longitude,
-            "source_type": source_type,
-            "headline": str(headline)[:500],
-            "narrative_text": narrative,
-            "issued_at": issued_at,
-            "effective_at": effective_at,
-            "payload": payload,
-            "content_hash": content_hash,
+            "grid_office": props.get("gridId"),
+            "grid_x": props.get("gridX"),
+            "grid_y": props.get("gridY"),
+            "forecast_url": props.get("forecast"),
+            "forecast_hourly_url": props.get("forecastHourly"),
+            "time_zone": props.get("timeZone"),
+            "resolved_label": label,
+            "latitude": latitude,
+            "longitude": longitude,
         }
+
+    # -- Raw product fetches ---------------------------------------------
+
+    def get_active_alerts(self, latitude: float, longitude: float) -> list[dict]:
+        """Active watches, warnings and advisories covering a point."""
+        data = self.get(
+            "/alerts/active", params={"point": f"{latitude:.4f},{longitude:.4f}"}
+        )
+        return data.get("features", []) or []
+
+    def get_forecast(self, grid: dict) -> list[dict]:
+        """The multi-day narrative forecast for a grid cell."""
+        office, x, y = grid["grid_office"], grid["grid_x"], grid["grid_y"]
+        if not office or x is None or y is None:
+            return []
+        data = self.get(f"/gridpoints/{office}/{x},{y}/forecast")
+        return (data.get("properties", {}) or {}).get("periods", []) or []
+
+    # -- Normalization ----------------------------------------------------
+
+    def normalize_alert(self, feature: dict, grid: dict) -> dict | None:
+        """Turn one alert GeoJSON feature into a weather document."""
+        props = feature.get("properties", {}) or {}
+        alert_id = props.get("id") or feature.get("id")
+        if not alert_id:
+            return None
+
+        # The description carries the meteorological narrative and the
+        # instruction carries the protective action ("Turn around, don't
+        # drown"). Retrieval is far more useful with both, so they are
+        # embedded as one document rather than two.
+        parts = [
+            (props.get("headline") or "").strip(),
+            (props.get("description") or "").strip(),
+            (props.get("instruction") or "").strip(),
+        ]
+        narrative = "\n\n".join(part for part in parts if part)
+        if not narrative:
+            return None
+
+        return {
+            "id": f"alert:{alert_id}",
+            "location": grid["resolved_label"],
+            "latitude": grid["latitude"],
+            "longitude": grid["longitude"],
+            "grid_office": grid["grid_office"],
+            "grid_x": grid["grid_x"],
+            "grid_y": grid["grid_y"],
+            "source_type": SOURCE_TYPE_ALERT,
+            "event": props.get("event"),
+            "headline": props.get("headline") or props.get("event"),
+            "severity": props.get("severity"),
+            "urgency": props.get("urgency"),
+            "certainty": props.get("certainty"),
+            "area_desc": props.get("areaDesc"),
+            "narrative_text": narrative,
+            "issued_at": _parse_timestamp(props.get("sent")),
+            "effective_at": _parse_timestamp(
+                props.get("onset") or props.get("effective")
+            ),
+            "expires_at": _parse_timestamp(props.get("ends") or props.get("expires")),
+            "content_hash": content_hash(narrative),
+            "payload": feature,
+        }
+
+    def normalize_forecast_period(self, period: dict, grid: dict) -> dict | None:
+        """Turn one forecast period into a weather document."""
+        narrative = (period.get("detailedForecast") or "").strip()
+        if not narrative:
+            return None
+
+        start = _parse_timestamp(period.get("startTime"))
+        name = period.get("name") or f"period-{period.get('number', 0)}"
+
+        # Dedup key: the same grid cell + period start always refers to the
+        # same slice of time, so a re-issued forecast updates the row in place
+        # instead of piling up near-duplicates.
+        doc_id = (
+            f"forecast:{grid['grid_office']}:{grid['grid_x']},{grid['grid_y']}:"
+            f"{start or 'unknown'}:{_slugify(name)}"
+        )
+
+        short = period.get("shortForecast") or name
+        headline = f"{name}: {short}"
+
+        return {
+            "id": doc_id,
+            "location": grid["resolved_label"],
+            "latitude": grid["latitude"],
+            "longitude": grid["longitude"],
+            "grid_office": grid["grid_office"],
+            "grid_x": grid["grid_x"],
+            "grid_y": grid["grid_y"],
+            "source_type": SOURCE_TYPE_FORECAST,
+            "event": short,
+            "headline": headline,
+            "severity": None,
+            "urgency": None,
+            "certainty": None,
+            "area_desc": grid["resolved_label"],
+            "narrative_text": narrative,
+            "issued_at": start,
+            "effective_at": start,
+            "expires_at": _parse_timestamp(period.get("endTime")),
+            "content_hash": content_hash(narrative),
+            "payload": period,
+        }
+
+    # -- Public entry point ----------------------------------------------
+
+    def fetch_documents(
+        self,
+        locations: Iterable[str],
+        limit: int = 50,
+        include_alerts: bool = True,
+        include_forecast: bool = True,
+    ) -> tuple[list[dict], list[dict]]:
+        """Harvest normalized documents for a list of locations.
+
+        Returns ``(documents, errors)``. A location that fails to resolve or
+        whose products are unavailable is reported in ``errors`` and skipped,
+        so one bad entry never sinks the whole sync.
+        """
+        documents: list[dict] = []
+        errors: list[dict] = []
+        seen_ids: set[str] = set()
+
+        for location in locations:
+            try:
+                latitude, longitude = self.resolve_location(location)
+                grid = self.resolve_grid_point(latitude, longitude)
+            except (LocationResolutionError, requests.RequestException) as exc:
+                errors.append({"location": location, "error": str(exc)})
+                continue
+
+            per_location: list[dict] = []
+
+            if include_alerts:
+                try:
+                    for feature in self.get_active_alerts(latitude, longitude):
+                        doc = self.normalize_alert(feature, grid)
+                        if doc:
+                            per_location.append(doc)
+                except requests.RequestException as exc:
+                    errors.append(
+                        {"location": location, "error": f"alerts unavailable: {exc}"}
+                    )
+
+            if include_forecast:
+                try:
+                    for period in self.get_forecast(grid):
+                        doc = self.normalize_forecast_period(period, grid)
+                        if doc:
+                            per_location.append(doc)
+                except requests.RequestException as exc:
+                    errors.append(
+                        {"location": location, "error": f"forecast unavailable: {exc}"}
+                    )
+
+            # Alerts come first so that when `limit` bites, the safety-critical
+            # documents are the ones that survive.
+            per_location.sort(key=lambda d: d["source_type"] != SOURCE_TYPE_ALERT)
+
+            for doc in per_location[:limit]:
+                if doc["id"] in seen_ids:
+                    continue
+                seen_ids.add(doc["id"])
+                documents.append(doc)
+
+        return documents, errors

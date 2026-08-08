@@ -1,113 +1,805 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Weather Intelligence</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Weather Intelligence</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Public+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    /* Pale blue-grey of a printed surface analysis chart, navy ink, and the
+       NWS warning colour taxonomy for severity. */
+    --paper:      #e8edf2;
+    --panel:      #fbfcfd;
+    --ink:        #0d1b2a;
+    --ink-soft:   #5c6e82;
+    --ink-faint:  #8a9aab;
+    --rule:       #c6d2dd;
+    --isobar:     #d9e2ea;
+    --accent:     #14507f;
+    --accent-dim: #e2ebf3;
+
+    --sev-extreme:  #6e0f1a;
+    --sev-severe:   #b3301c;
+    --sev-moderate: #c77e12;
+    --sev-minor:    #1f7a5c;
+    --sev-neutral:  #4a6b8a;
+
+    --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+    --display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+    --body: "Public Sans", -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  html { -webkit-text-size-adjust: 100%; }
+
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--body);
+    font-size: 15px;
+    line-height: 1.55;
+  }
+
+  /* ---- Product header strip: a live teletype status line ---------------- */
+
+  .masthead {
+    border-bottom: 1px solid var(--rule);
+    background: var(--panel);
+  }
+
+  .masthead-inner {
+    max-width: 1160px;
+    margin: 0 auto;
+    padding: 22px 28px 18px;
+  }
+
+  .wordmark {
+    font-family: var(--display);
+    font-weight: 700;
+    font-size: 27px;
+    letter-spacing: -0.022em;
+    margin: 0;
+  }
+
+  .wordmark span { color: var(--accent); }
+
+  .tagline {
+    color: var(--ink-soft);
+    font-size: 14px;
+    margin: 3px 0 0;
+    max-width: 62ch;
+  }
+
+  .statusline {
+    margin-top: 16px;
+    padding: 9px 12px;
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--accent);
+    background: #f2f6f9;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: 0.06em;
+    color: var(--ink-soft);
+    text-transform: uppercase;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+
+  .statusline b { color: var(--ink); font-weight: 500; }
+  .statusline .sep { color: var(--ink-faint); padding: 0 10px; }
+
+  /* ---- Layout ----------------------------------------------------------- */
+
+  .layout {
+    max-width: 1160px;
+    margin: 0 auto;
+    padding: 26px 28px 72px;
+    display: grid;
+    grid-template-columns: 356px 1fr;
+    gap: 26px;
+    align-items: start;
+  }
+
+  @media (max-width: 900px) {
+    .layout { grid-template-columns: 1fr; padding: 20px 18px 56px; }
+    .masthead-inner { padding: 20px 18px 16px; }
+  }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    padding: 20px;
+  }
+
+  .panel + .panel { margin-top: 18px; }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    margin: 0 0 3px;
+  }
+
+  .panel h2 {
+    font-family: var(--display);
+    font-weight: 600;
+    font-size: 18px;
+    letter-spacing: -0.012em;
+    margin: 0 0 4px;
+  }
+
+  .panel p.note {
+    color: var(--ink-soft);
+    font-size: 13px;
+    margin: 0 0 16px;
+  }
+
+  code {
+    font-family: var(--mono);
+    font-size: 12px;
+    background: var(--accent-dim);
+    color: var(--accent);
+    padding: 1px 4px;
+  }
+
+  /* ---- Form controls ---------------------------------------------------- */
+
+  label {
+    display: block;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    color: var(--ink);
+    margin-bottom: 5px;
+  }
+
+  .field + .field { margin-top: 14px; }
+
+  input[type="text"],
+  input[type="number"],
+  textarea,
+  select {
+    width: 100%;
+    padding: 9px 11px;
+    border: 1px solid var(--rule);
+    border-radius: 0;
+    background: #fff;
+    color: var(--ink);
+    font-family: var(--body);
+    font-size: 14px;
+    transition: border-color 0.12s ease, box-shadow 0.12s ease;
+  }
+
+  textarea { resize: vertical; min-height: 108px; line-height: 1.55; }
+
+  input:focus, textarea:focus, select:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: inset 0 -2px 0 var(--accent);
+  }
+
+  .row { display: flex; gap: 12px; }
+  .row > .field { flex: 1; margin-top: 0; }
+
+  .checks {
+    display: flex;
+    gap: 18px;
+    margin-top: 14px;
+    font-size: 13px;
+    color: var(--ink-soft);
+  }
+
+  .checks label {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-weight: 400;
+    font-size: 13px;
+    margin: 0;
+    cursor: pointer;
+  }
+
+  input[type="checkbox"] { accent-color: var(--accent); margin: 0; }
+
+  button {
+    font-family: var(--body);
+    font-size: 13.5px;
+    font-weight: 600;
+    padding: 10px 16px;
+    border: 1px solid var(--accent);
+    border-radius: 0;
+    background: var(--accent);
+    color: #fff;
+    cursor: pointer;
+    transition: background 0.12s ease, color 0.12s ease;
+  }
+
+  button:hover:not(:disabled) { background: #0e3d63; border-color: #0e3d63; }
+  button:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+  button:disabled { opacity: 0.5; cursor: progress; }
+
+  button.secondary { background: transparent; color: var(--accent); }
+  button.secondary:hover:not(:disabled) { background: var(--accent-dim); color: var(--accent); border-color: var(--accent); }
+
+  .actions { display: flex; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
+
+  /* ---- Feedback --------------------------------------------------------- */
+
+  .feedback {
+    margin-top: 14px;
+    padding: 10px 12px;
+    border-left: 3px solid var(--ink-faint);
+    background: #f2f6f9;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--ink-soft);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .feedback.ok    { border-left-color: var(--sev-minor); color: var(--ink); }
+  .feedback.error { border-left-color: var(--sev-severe); color: var(--sev-severe); }
+  .feedback:empty { display: none; }
+
+  /* ---- Search ----------------------------------------------------------- */
+
+  .searchbar { display: flex; gap: 0; border: 1px solid var(--rule); background: #fff; }
+  .searchbar:focus-within { border-color: var(--accent); }
+
+  .searchbar input[type="text"] {
+    border: none;
+    font-size: 16px;
+    padding: 13px 14px;
+  }
+  .searchbar input[type="text"]:focus { box-shadow: none; }
+
+  .searchbar button { border: none; border-left: 1px solid var(--accent); padding: 0 20px; }
+
+  .examples { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
+
+  .chip {
+    font-family: var(--body);
+    font-size: 12.5px;
+    font-weight: 400;
+    padding: 5px 10px;
+    border: 1px solid var(--rule);
+    background: transparent;
+    color: var(--ink-soft);
+  }
+  .chip:hover:not(:disabled) { background: var(--accent-dim); border-color: var(--accent); color: var(--accent); }
+
+  .searchopts { display: flex; gap: 14px; margin-top: 14px; align-items: flex-end; }
+  .searchopts .field { flex: 0 0 118px; margin-top: 0; }
+
+  /* ---- Results ---------------------------------------------------------- */
+
+  .results { margin-top: 22px; }
+
+  .results-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 14px;
+    padding-bottom: 9px;
+    border-bottom: 1px solid var(--rule);
+    margin-bottom: 2px;
+  }
+
+  .results-head h2 {
+    font-family: var(--display);
+    font-weight: 600;
+    font-size: 16px;
+    margin: 0;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .results-head .count {
+    flex: 0 0 auto;
+    white-space: nowrap;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+
+  .hit {
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-left: 4px solid var(--sev-neutral);
+    padding: 16px 18px;
+    margin-top: 12px;
+    animation: rise 0.32s ease both;
+  }
+
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(7px); }
+    to   { opacity: 1; transform: none; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .hit { animation: none; }
+  }
+
+  .hit[data-severity="Extreme"]  { border-left-color: var(--sev-extreme); }
+  .hit[data-severity="Severe"]   { border-left-color: var(--sev-severe); }
+  .hit[data-severity="Moderate"] { border-left-color: var(--sev-moderate); }
+  .hit[data-severity="Minor"]    { border-left-color: var(--sev-minor); }
+
+  .hit-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+  }
+
+  .hit-place {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    margin-bottom: 3px;
+  }
+
+  .hit-place .tag { color: var(--accent); }
+  .hit-place .sev { color: var(--sev-severe); }
+
+  .hit h3 {
+    font-family: var(--display);
+    font-weight: 600;
+    font-size: 16.5px;
+    letter-spacing: -0.008em;
+    line-height: 1.3;
+    margin: 0;
+  }
+
+  .hit-body {
+    margin: 10px 0 0;
+    color: var(--ink-soft);
+    font-size: 14px;
+  }
+
+  .hit-foot {
+    margin-top: 11px;
+    padding-top: 9px;
+    border-top: 1px dashed var(--isobar);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+
+  /* Signature: similarity drawn as a segmented scale, the way a radar legend
+     steps through reflectivity bins rather than showing a raw number. */
+  .scale { flex: 0 0 auto; text-align: right; }
+
+  .scale-bars { display: flex; gap: 2px; justify-content: flex-end; }
+
+  .scale-bars i {
+    display: block;
+    width: 7px;
+    height: 15px;
+    background: var(--isobar);
+  }
+
+  .scale-bars i.on { background: var(--accent); }
+  .scale-bars i.on:nth-child(n+8) { background: var(--sev-severe); }
+
+  .scale-num {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--ink);
+    margin-top: 4px;
+  }
+
+  .scale-label {
+    font-family: var(--mono);
+    font-size: 9.5px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+
+  /* ---- Empty state ------------------------------------------------------ */
+
+  .empty {
+    border: 1px dashed var(--rule);
+    background: transparent;
+    padding: 34px 24px;
+    text-align: center;
+    color: var(--ink-soft);
+    margin-top: 12px;
+  }
+
+  .empty strong {
+    display: block;
+    font-family: var(--display);
+    font-weight: 600;
+    font-size: 16px;
+    color: var(--ink);
+    margin-bottom: 5px;
+  }
+
+  .empty p { margin: 0; font-size: 13.5px; }
+
+  .sr-only {
+    position: absolute; width: 1px; height: 1px;
+    padding: 0; margin: -1px; overflow: hidden;
+    clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+  }
+</style>
 </head>
 <body>
-  <header>
-    <a class="brand" href="/">Weather Intelligence</a>
-    <span class="status"><i></i> Lakebase + pgvector</span>
-  </header>
-  <main>
-    <section class="hero">
-      <p class="eyebrow">SEMANTIC WEATHER RETRIEVAL</p>
-      <h1>Search forecasts by meaning,<br>not only keywords.</h1>
-      <p>Harvest National Weather Service narratives, embed them in Lakebase, and retrieve the passages most relevant to a natural-language question.</p>
+
+<header class="masthead">
+  <div class="masthead-inner">
+    <h1 class="wordmark">Weather<span>&#8202;/&#8202;</span>Intelligence</h1>
+    <p class="tagline">
+      Semantic search over live National Weather Service alerts and forecast
+      narratives, vectorized into Lakebase.
+    </p>
+    <div class="statusline" id="statusline" aria-live="polite">
+      Reading pipeline status&hellip;
+    </div>
+  </div>
+</header>
+
+<main class="layout">
+
+  <div>
+    <section class="panel">
+      <p class="eyebrow">Step 1</p>
+      <h2>Sync weather data</h2>
+      <p class="note">
+        Pulls active alerts and multi-day forecast narratives for each location
+        and stores them in <code>weather_documents</code>.
+      </p>
+
+      <div class="field">
+        <label for="locations">Locations</label>
+        <textarea id="locations" rows="5"
+          placeholder="Chicago, IL&#10;Austin, TX&#10;41.88,-87.63">Chicago, IL
+Austin, TX
+Denver, CO
+Miami, FL
+Seattle, WA</textarea>
+      </div>
+
+      <div class="field">
+        <label for="sync-limit">Documents per location</label>
+        <input type="number" id="sync-limit" value="50" min="1" max="200">
+      </div>
+
+      <div class="checks">
+        <label><input type="checkbox" id="inc-alerts" checked> Alerts</label>
+        <label><input type="checkbox" id="inc-forecast" checked> Forecasts</label>
+      </div>
+
+      <div class="actions">
+        <button id="btn-sync">Sync weather data</button>
+      </div>
+
+      <div class="feedback" id="sync-feedback" aria-live="polite"></div>
     </section>
 
-    <section class="stats" id="stats">
-      <div><strong>—</strong><span>Documents</span></div>
-      <div><strong>—</strong><span>Embeddings</span></div>
-      <div><strong>—</strong><span>Locations</span></div>
+    <section class="panel">
+      <p class="eyebrow">Step 2</p>
+      <h2>Generate embeddings</h2>
+      <p class="note">
+        Chunks every narrative that has no current vector, embeds it, and writes
+        the result to <code>weather_embeddings</code>. Unchanged text is skipped.
+      </p>
+      <div class="actions">
+        <button id="btn-embed" class="secondary">Generate embeddings</button>
+      </div>
+      <div class="feedback" id="embed-feedback" aria-live="polite"></div>
     </section>
+  </div>
 
-    <section class="workspace">
-      <article class="panel">
-        <div class="step">1</div>
-        <h2>Sync weather documents</h2>
-        <p>Enter one city/state or latitude/longitude per line.</p>
-        <textarea id="locations">{{ default_locations|join('\n') }}</textarea>
-        <label>Maximum documents per location<input id="limit" type="number" min="1" max="200" value="50"></label>
-        <button id="sync">Sync from NWS</button>
-        <pre id="sync-output" class="output" hidden></pre>
-      </article>
+  <div>
+    <section class="panel">
+      <p class="eyebrow">Step 3</p>
+      <h2>Search by meaning</h2>
+      <p class="note">
+        Describe the conditions you care about in your own words. Matching is by
+        meaning, not keywords, so wording that never appears in a forecast still
+        finds the right one.
+      </p>
 
-      <article class="panel embed-panel">
-        <div class="step">2</div>
-        <h2>Generate embeddings</h2>
-        <p>Open the repository notebook in Databricks after syncing new weather data.</p>
-        <code>notebooks/<br>ingest_weather_embeddings.ipynb</code>
-        <ul>
-          <li>Chunks narrative text</li>
-          <li>Creates 384-dim vectors</li>
-          <li>Writes with psycopg2</li>
-          <li>Verifies vector search</li>
-        </ul>
-        <small>Rerun the notebook after later syncs to embed new or changed documents.</small>
-      </article>
+      <form id="search-form">
+        <div class="searchbar">
+          <label class="sr-only" for="query">Search weather documents</label>
+          <input type="text" id="query" autocomplete="off"
+                 placeholder="flash flood risk this weekend">
+          <button type="submit" id="btn-search">Search</button>
+        </div>
 
-      <article class="panel search-panel">
-        <div class="step">3</div>
-        <h2>Semantic search</h2>
-        <p>After the notebook finishes, search by weather risk or condition.</p>
-        <form id="search-form">
-          <input id="query" required placeholder="flash flood risk this weekend">
-          <div class="row">
-            <select id="source-type"><option value="">All documents</option><option value="alert">Alerts</option><option value="forecast">Forecasts</option></select>
-            <input id="top-k" type="number" min="1" max="20" value="5">
-            <button>Search vectors</button>
+        <div class="examples" id="examples">
+          <button type="button" class="chip">flash flood risk this weekend</button>
+          <button type="button" class="chip">dangerous heat and humidity</button>
+          <button type="button" class="chip">roads may be slick from snow or ice</button>
+          <button type="button" class="chip">winds strong enough to down power lines</button>
+          <button type="button" class="chip">clear and pleasant for being outside</button>
+        </div>
+
+        <div class="searchopts">
+          <div class="field">
+            <label for="top-k">Results</label>
+            <input type="number" id="top-k" value="5" min="1" max="20">
           </div>
-        </form>
-        <div id="results" class="results"><div class="empty">Search results will appear here.</div></div>
-      </article>
+          <div class="field">
+            <label for="source-type">Source</label>
+            <select id="source-type">
+              <option value="">All</option>
+              <option value="alert">Alerts</option>
+              <option value="forecast">Forecasts</option>
+            </select>
+          </div>
+        </div>
+      </form>
+
+      <div class="feedback" id="search-feedback" aria-live="polite"></div>
     </section>
 
-    <section class="pipeline">
-      <div><span>1</span><strong>Harvest</strong><small>NWS alerts + forecasts</small></div>
-      <b>→</b><div><span>2</span><strong>Embed</strong><small>384-dim MiniLM vectors</small></div>
-      <b>→</b><div><span>3</span><strong>Retrieve</strong><small>Cosine similarity in pgvector</small></div>
+    <section class="results">
+      <div class="results-head">
+        <h2 id="results-title">Results</h2>
+        <span class="count" id="results-count"></span>
+      </div>
+      <div id="results">
+        <div class="empty">
+          <strong>Nothing searched yet</strong>
+          <p>Sync a few locations, generate embeddings, then ask about the weather.</p>
+        </div>
+      </div>
     </section>
-  </main>
-  <script>
-    const output = document.getElementById('sync-output');
-    const results = document.getElementById('results');
-    async function loadStats() {
-      try {
-        const response = await fetch('/weather/stats');
-        const data = await response.json();
-        const values = [data.documents, data.embeddings, data.locations];
-        document.querySelectorAll('#stats strong').forEach((node, index) => node.textContent = values[index] ?? '—');
-      } catch (_) {}
+  </div>
+
+</main>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+
+  const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[ch]));
+
+  function say(node, message, kind) {
+    node.textContent = message;
+    node.className = "feedback" + (kind ? " " + kind : "");
+  }
+
+  async function callApi(path, options) {
+    const response = await fetch(path, options);
+    let payload;
+    try {
+      payload = await response.json();
+    } catch (err) {
+      throw new Error("The server returned an unreadable response (HTTP " + response.status + ").");
     }
-    document.getElementById('sync').addEventListener('click', async () => {
-      output.hidden = false;
-      output.textContent = 'Syncing…';
-      const locations = document.getElementById('locations').value.split('\n').map(v => v.trim()).filter(Boolean);
-      try {
-        const response = await fetch('/weather/sync', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({locations, limit: Number(document.getElementById('limit').value)})});
-        const data = await response.json();
-        output.textContent = JSON.stringify(data, null, 2);
-        loadStats();
-      } catch (error) { output.textContent = error.message; }
-    });
-    document.getElementById('search-form').addEventListener('submit', async (event) => {
-      event.preventDefault();
-      results.innerHTML = '<div class="empty">Searching…</div>';
-      const payload = {query: document.getElementById('query').value, top_k: Number(document.getElementById('top-k').value)};
-      const source = document.getElementById('source-type').value;
-      if (source) payload.source_type = source;
-      try {
-        const response = await fetch('/weather/search', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || 'Search failed');
-        results.innerHTML = data.matches.map((item, index) => `<article class="result"><header><span>#${index + 1} · ${escapeHtml(item.source_type)}</span><strong>${Number(item.similarity).toFixed(3)}</strong></header><h3>${escapeHtml(item.headline)}</h3><p class="location">${escapeHtml(item.location)}</p><p>${escapeHtml(item.chunk_text)}</p></article>`).join('') || '<div class="empty">No matches.</div>';
-      } catch (error) { results.innerHTML = `<div class="error">${escapeHtml(error.message)}</div>`; }
-    });
-    function escapeHtml(value) { const div = document.createElement('div'); div.textContent = value ?? ''; return div.innerHTML; }
-    loadStats();
-  </script>
+    if (!response.ok) {
+      throw new Error(payload.error || "Request failed with HTTP " + response.status + ".");
+    }
+    return payload;
+  }
+
+  /* ---- Status line ------------------------------------------------------ */
+
+  const pad = (value, width) => String(value ?? 0).padStart(width, "0");
+
+  async function refreshStatus() {
+    const line = $("statusline");
+    try {
+      const s = await callApi("/weather/stats");
+      const stamp = s.last_synced_at
+        ? new Date(s.last_synced_at).toISOString().slice(0, 16).replace("T", " ") + "Z"
+        : "never";
+      const model = String(s.model_name || "").split("/").pop();
+      line.innerHTML =
+        "Lakebase" +
+        '<span class="sep">/</span>docs <b>' + pad(s.documents, 4) + "</b>" +
+        '<span class="sep">/</span>alerts <b>' + pad(s.alerts, 4) + "</b>" +
+        '<span class="sep">/</span>forecasts <b>' + pad(s.forecasts, 4) + "</b>" +
+        '<span class="sep">/</span>vectors <b>' + pad(s.chunks, 5) + "</b>" +
+        '<span class="sep">/</span>model <b>' + escapeHtml(model) + " " + s.embedding_dim + "d</b>" +
+        '<span class="sep">/</span>last sync <b>' + escapeHtml(stamp) + "</b>";
+    } catch (err) {
+      line.innerHTML = "Lakebase unreachable &mdash; " + escapeHtml(err.message);
+    }
+  }
+
+  /* ---- Step 1: sync ------------------------------------------------------ */
+
+  $("btn-sync").addEventListener("click", async () => {
+    const button = $("btn-sync");
+    const feedback = $("sync-feedback");
+
+    const locations = $("locations").value
+      .split(/[\n;]+/).map((s) => s.trim()).filter(Boolean);
+
+    if (!locations.length) {
+      say(feedback, "Add at least one location, one per line.", "error");
+      return;
+    }
+
+    button.disabled = true;
+    say(feedback, "Contacting the National Weather Service\u2026");
+
+    try {
+      const result = await callApi("/weather/sync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          locations: locations,
+          limit: Number($("sync-limit").value) || 50,
+          include_alerts: $("inc-alerts").checked,
+          include_forecast: $("inc-forecast").checked
+        })
+      });
+
+      let message = "Synced " + result.synced + " documents \u2014 "
+        + result.alerts + " alerts, " + result.forecasts + " forecasts.";
+      if (result.errors && result.errors.length) {
+        message += "\nSkipped: " + result.errors
+          .map((e) => e.location + " (" + e.error + ")").join("; ");
+      }
+      say(feedback, message, "ok");
+      refreshStatus();
+    } catch (err) {
+      say(feedback, err.message, "error");
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  /* ---- Step 2: embed ----------------------------------------------------- */
+
+  $("btn-embed").addEventListener("click", async () => {
+    const button = $("btn-embed");
+    const feedback = $("embed-feedback");
+
+    button.disabled = true;
+    say(feedback, "Chunking and embedding\u2026 the first run loads the model, which takes a moment.");
+
+    try {
+      const result = await callApi("/weather/embed", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({})
+      });
+
+      say(feedback, result.chunks_written === 0
+        ? "Everything is already embedded. Sync new locations to add more."
+        : "Embedded " + result.documents_processed + " documents into "
+          + result.chunks_written + " chunks with " + result.model_name + ".",
+        "ok");
+      refreshStatus();
+    } catch (err) {
+      say(feedback, err.message, "error");
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  /* ---- Step 3: search ---------------------------------------------------- */
+
+  function scaleBars(similarity) {
+    const filled = Math.max(1, Math.min(10, Math.round(similarity * 10)));
+    let html = "";
+    for (let i = 0; i < 10; i++) {
+      html += '<i class="' + (i < filled ? "on" : "") + '"></i>';
+    }
+    return html;
+  }
+
+  function renderHits(payload) {
+    const container = $("results");
+    const hits = payload.results || [];
+
+    $("results-title").textContent = "Results for \u201c" + payload.query + "\u201d";
+    $("results-count").textContent = hits.length
+      ? hits.length + " match" + (hits.length === 1 ? "" : "es")
+      : "";
+
+    if (!hits.length) {
+      container.innerHTML =
+        '<div class="empty"><strong>No matches yet</strong><p>'
+        + escapeHtml(payload.message || "Nothing in Lakebase matched that query.")
+        + "</p></div>";
+      return;
+    }
+
+    container.innerHTML = hits.map((hit, index) => {
+      const meta = [
+        '<span class="tag">' + escapeHtml(hit.source_type) + "</span>",
+        escapeHtml(hit.location)
+      ];
+      if (hit.severity) {
+        meta.push('<span class="sev">' + escapeHtml(hit.severity) + "</span>");
+      }
+
+      const window_ = [];
+      if (hit.effective_at) {
+        window_.push("From " + new Date(hit.effective_at).toLocaleString());
+      }
+      if (hit.expires_at) {
+        window_.push("through " + new Date(hit.expires_at).toLocaleString());
+      }
+      window_.push("chunk " + hit.chunk_index);
+
+      return '<article class="hit" data-severity="' + escapeHtml(hit.severity || "") + '"'
+        + ' style="animation-delay:' + (index * 45) + 'ms">'
+        + '<div class="hit-top"><div>'
+        + '<p class="hit-place">' + meta.join(" &middot; ") + "</p>"
+        + "<h3>" + escapeHtml(hit.headline || hit.event || "Weather narrative") + "</h3>"
+        + "</div>"
+        + '<div class="scale"><div class="scale-bars">' + scaleBars(hit.similarity) + "</div>"
+        + '<div class="scale-num">' + hit.similarity.toFixed(3) + "</div>"
+        + '<div class="scale-label">similarity</div></div>'
+        + "</div>"
+        + '<p class="hit-body">' + escapeHtml(hit.chunk_text) + "</p>"
+        + '<p class="hit-foot">' + escapeHtml(window_.join(" \u00b7 ")) + "</p>"
+        + "</article>";
+    }).join("");
+  }
+
+  async function runSearch() {
+    const button = $("btn-search");
+    const feedback = $("search-feedback");
+    const query = $("query").value.trim();
+
+    if (!query) {
+      say(feedback, "Type what you want to find.", "error");
+      return;
+    }
+
+    button.disabled = true;
+    say(feedback, "Searching\u2026");
+
+    try {
+      const payload = await callApi("/weather/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          query: query,
+          top_k: Number($("top-k").value) || 5,
+          source_type: $("source-type").value || null
+        })
+      });
+      say(feedback, "", "");
+      renderHits(payload);
+    } catch (err) {
+      say(feedback, err.message, "error");
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  $("search-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    runSearch();
+  });
+
+  $("examples").addEventListener("click", (event) => {
+    const chip = event.target.closest(".chip");
+    if (!chip) return;
+    $("query").value = chip.textContent.trim();
+    runSearch();
+  });
+
+  refreshStatus();
+</script>
 </body>
 </html>

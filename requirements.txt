@@ -1,7 +1,7 @@
-Flask>=3.1.1,<4
-databricks-sdk>=0.57.0
-psycopg2-binary>=2.9.10
-python-dotenv>=1.1.1
+# Databricks App runtime dependencies.
+databricks-sdk>=0.30.0
+flask>=3.0.3
+psycopg2-binary>=2.9.9
 requests>=2.32.3
-sentence-transformers>=5.0.0,<6
-
+sentence-transformers>=3.0.0
+python-dotenv>=1.0.1

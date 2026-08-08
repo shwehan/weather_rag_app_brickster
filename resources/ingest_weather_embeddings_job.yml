@@ -1,0 +1,61 @@
+# Scheduled re-sync of NWS alerts and forecasts, followed by embedding of any
+# narrative that changed since the last run.
+#
+# Alerts are the reason this runs often: a warning issued at 14:10 is useless
+# to a retrieval system that refreshes nightly. Every 30 minutes keeps active
+# watches and warnings searchable while staying well inside the NWS guidance on
+# request volume. Unchanged text is skipped by content hash, so a run with no
+# new weather costs one API call per location and no embedding work at all.
+
+resources:
+  jobs:
+    ingest_weather_embeddings_job:
+      name: "[${bundle.target}] Ingest weather narratives and embeddings"
+
+      schedule:
+        quartz_cron_expression: "0 0,30 * * * ?"
+        timezone_id: "UTC"
+        pause_status: PAUSED   # flip to UNPAUSED after a successful manual run
+
+      email_notifications:
+        on_failure:
+          - ${workspace.current_user.userName}
+
+      max_concurrent_runs: 1
+
+      job_clusters:
+        - job_cluster_key: default_cluster
+          new_cluster:
+            spark_version: "15.4.x-scala2.12"
+            node_type_id: "i3.xlarge"
+            # The pipeline is a single-node Python workload -- harvesting is
+            # network-bound and MiniLM embedding of a few thousand short chunks
+            # takes seconds. Workers would sit idle, so don't pay for them.
+            num_workers: 0
+            spark_conf:
+              spark.master: "local[*]"
+              spark.databricks.cluster.profile: singleNode
+            custom_tags:
+              ResourceClass: SingleNode
+            data_security_mode: SINGLE_USER
+
+      tasks:
+        - task_key: ingest_weather_embeddings
+          job_cluster_key: default_cluster
+          notebook_task:
+            notebook_path: ../notebooks/ingest_weather_embeddings.py
+            base_parameters:
+              documents_table: "weather_documents"
+              embeddings_table: "weather_embeddings"
+              embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+              locations: "Chicago, IL;Austin, TX;Denver, CO;Miami, FL;Seattle, WA"
+              sync_limit: "50"
+              chunk_size: "800"
+              chunk_overlap: "100"
+              nws_user_agent: "weather-intelligence-app (your.email@example.com)"
+              skip_sync: "false"
+          libraries:
+            - pypi:
+                package: "psycopg2-binary>=2.9.9"
+            - pypi:
+                package: "sentence-transformers>=3.0.0"
