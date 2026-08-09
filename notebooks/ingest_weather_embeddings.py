@@ -29,15 +29,15 @@ from __future__ import annotations
 
 # COMMAND ----------
 
-# MAGIC # Every dependency here is pure Python -- no compiled C extension, no
-# MAGIC # torch. That is deliberate: packages like psycopg2 and
-# MAGIC # sentence-transformers (which pulls in torch) reliably crash the whole
-# MAGIC # kernel with a SIGABRT on Databricks serverless compute, including
-# MAGIC # Databricks Free Edition, which is serverless-only. pg8000 is a
-# MAGIC # pure-Python Postgres driver, and embeddings come from a Databricks
-# MAGIC # Model Serving endpoint called over REST rather than a local model, so
-# MAGIC # there is nothing here that can trigger that crash.
-# MAGIC %pip install -q --upgrade "databricks-sdk>=0.30.0" "pg8000>=1.31.2" requests
+# Every dependency here is pure Python -- no compiled C extension, no
+# torch. That is deliberate: packages like psycopg2 and
+# sentence-transformers (which pulls in torch) reliably crash the whole
+# kernel with a SIGABRT on Databricks serverless compute, including
+# Databricks Free Edition, which is serverless-only. pg8000 is a
+# pure-Python Postgres driver, and embeddings come from a Databricks
+# Model Serving endpoint called over REST rather than a local model, so
+# there is nothing here that can trigger that crash.
+%pip install -q --upgrade "databricks-sdk>=0.30.0" "pg8000>=1.31.2" requests
 
 # COMMAND ----------
 
@@ -179,7 +179,10 @@ else:
 
 # DBTITLE 1,Chunk, embed and load
 started = time.perf_counter()
-embed_summary = embedding_pipeline.embed_pending_documents(progress=True)
+
+# Process a limited number of documents at a time to avoid rate limits.
+# The pay-per-token databricks-gte-large-en endpoint has strict QPS limits.
+embed_summary = embedding_pipeline.embed_pending_documents(limit=5, progress=True)
 embed_summary["seconds"] = round(time.perf_counter() - started, 2)
 
 print(json.dumps(embed_summary, indent=2))

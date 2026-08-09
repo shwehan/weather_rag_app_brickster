@@ -113,7 +113,7 @@ def run_query(sql: str, params: tuple | None = None) -> list[dict]:
     with get_connection() as conn:
         cursor = conn.cursor()
         try:
-            cursor.execute(sql, params)
+            cursor.execute(sql, params if params is not None else tuple())
             return _rows_as_dicts(cursor)
         finally:
             cursor.close()
@@ -124,7 +124,7 @@ def run_write(sql: str, params: tuple | None = None) -> int:
     with get_connection() as conn:
         cursor = conn.cursor()
         try:
-            cursor.execute(sql, params)
+            cursor.execute(sql, params if params is not None else tuple())
             conn.commit()
             return cursor.rowcount
         finally:
