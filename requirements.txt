@@ -1,7 +1,13 @@
 # Databricks App runtime dependencies.
+#
+# Deliberately free of any package with a compiled C extension (psycopg2,
+# sentence-transformers/torch, etc). Those reliably crash the Python kernel
+# with a SIGABRT on Databricks serverless compute -- including Databricks
+# Free Edition, which is serverless-only. See README_WEATHER.md for the full
+# explanation. Every dependency below is pure Python or talks to a remote
+# service over HTTP.
 databricks-sdk>=0.30.0
 flask>=3.0.3
-psycopg2-binary>=2.9.9
+pg8000>=1.31.2
 requests>=2.32.3
-sentence-transformers>=3.0.0
 python-dotenv>=1.0.1

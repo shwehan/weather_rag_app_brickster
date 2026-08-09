@@ -6,6 +6,22 @@
 # watches and warnings searchable while staying well inside the NWS guidance on
 # request volume. Unchanged text is skipped by content hash, so a run with no
 # new weather costs one API call per location and no embedding work at all.
+#
+# This job runs on serverless compute -- there is no job_clusters/new_cluster
+# block, and the task has no cluster reference at all. That's deliberate, not
+# an oversight: Databricks Free Edition is serverless-only, so a classic
+# cluster spec here would simply fail to run. Serverless is also the right
+# choice regardless of edition for a workload this size -- harvesting is
+# network-bound and embedding a few thousand short chunks via a hosted
+# endpoint takes seconds; there's nothing here that benefits from a
+# provisioned cluster sitting idle between runs.
+#
+# Extra pip dependencies for a serverless task are declared under
+# `environments` below and referenced by `environment_key` -- that's the
+# serverless equivalent of the classic `libraries:` block on a task.
+#
+# The job's run-as identity needs CAN_QUERY on the databricks-gte-large-en
+# serving endpoint, the same grant noted in app.yaml for the deployed App.
 
 resources:
   jobs:
@@ -23,39 +39,34 @@ resources:
 
       max_concurrent_runs: 1
 
-      job_clusters:
-        - job_cluster_key: default_cluster
-          new_cluster:
-            spark_version: "15.4.x-scala2.12"
-            node_type_id: "i3.xlarge"
-            # The pipeline is a single-node Python workload -- harvesting is
-            # network-bound and MiniLM embedding of a few thousand short chunks
-            # takes seconds. Workers would sit idle, so don't pay for them.
-            num_workers: 0
-            spark_conf:
-              spark.master: "local[*]"
-              spark.databricks.cluster.profile: singleNode
-            custom_tags:
-              ResourceClass: SingleNode
-            data_security_mode: SINGLE_USER
+      environments:
+        - environment_key: weather_embeddings_env
+          spec:
+            client: "1"
+            dependencies:
+              # pg8000, not psycopg2: psycopg2's compiled C extension crashes
+              # the kernel with a SIGABRT on serverless compute. pg8000 is
+              # pure Python, so there's no compiled extension to conflict.
+              - "pg8000>=1.31.2"
+              - "requests>=2.32.3"
+              - "pandas"
+              # No sentence-transformers/torch: embeddings come from the
+              # databricks-gte-large-en Model Serving endpoint over REST
+              # (see notebooks/ingest_weather_embeddings.py), so nothing
+              # heavy needs to load locally here either.
 
       tasks:
         - task_key: ingest_weather_embeddings
-          job_cluster_key: default_cluster
+          environment_key: weather_embeddings_env
           notebook_task:
             notebook_path: ../notebooks/ingest_weather_embeddings.py
             base_parameters:
               documents_table: "weather_documents"
               embeddings_table: "weather_embeddings"
-              embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+              embedding_model: "databricks-gte-large-en"
               locations: "Chicago, IL;Austin, TX;Denver, CO;Miami, FL;Seattle, WA"
               sync_limit: "50"
               chunk_size: "800"
               chunk_overlap: "100"
               nws_user_agent: "weather-intelligence-app (your.email@example.com)"
               skip_sync: "false"
-          libraries:
-            - pypi:
-                package: "psycopg2-binary>=2.9.9"
-            - pypi:
-                package: "sentence-transformers>=3.0.0"

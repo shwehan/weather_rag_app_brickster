@@ -1,61 +1,27 @@
 """
-One-time setup: store the Lakebase connection URL in a Databricks secret.
+One-time setup script: creates the Databricks secret scope and stores the
+Lakebase connection URL. Run this locally (with the Databricks CLI configured)
+or from a notebook - never commit the resulting secret value anywhere.
 
-The National Weather Service API needs no key, so this is the only secret the
-project uses. Run it once from a machine with the Databricks CLI configured, or
-paste it into a notebook cell.
-
+Usage:
     python setup_secrets.py
-
-Nothing is printed and nothing is written to disk -- the URL goes straight from
-the prompt into the secret scope.
 """
-
-import getpass
-import sys
-
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service import workspace
+import getpass
 
-SCOPE = "database"
-KEY = "lakebase-url"
+w = WorkspaceClient()
 
-
-def main() -> int:
-    client = WorkspaceClient()
-
-    existing = {scope.name for scope in client.secrets.list_scopes()}
-    if SCOPE not in existing:
-        print(f"Creating secret scope {SCOPE!r}")
-        client.secrets.create_scope(scope=SCOPE)
-
-    url = getpass.getpass(
-        "Lakebase URL "
-        "(postgresql://role:password@host:5432/databricks_postgres?sslmode=require): "
-    ).strip()
-
-    if not url.startswith("postgres"):
-        print("That does not look like a Postgres URL. Nothing was saved.")
-        return 1
-
-    client.secrets.put_secret(scope=SCOPE, key=KEY, string_value=url)
-    print(f"Stored {SCOPE}/{KEY}")
-
-    # The notebook runs as you, but the deployed App runs as its own service
-    # principal. Granting the `users` group READ covers the interactive case;
-    # for the App, grant its service principal explicitly:
-    #
-    #   databricks secrets put-acl database <app-service-principal> READ
-    client.secrets.put_acl(
-        scope=SCOPE, principal="users", permission=workspace.AclPermission.READ
-    )
-    print(f"Granted READ on {SCOPE} to the 'users' group")
-    print(
-        "\nRemember to grant your Databricks App's service principal READ on "
-        "this scope as well, or the app cannot open a connection."
-    )
-    return 0
+# w.secrets.create_scope(scope="database")
+w.secrets.put_secret(
+    scope="database",
+    key="lakebase-url",
+    string_value=getpass.getpass("Paste your Lakebase URL: ")
+)
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+w.secrets.put_acl(
+    scope="database",
+    principal="users",
+    permission=workspace.AclPermission.READ,
+)

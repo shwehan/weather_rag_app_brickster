@@ -27,16 +27,35 @@ WEATHER_EMBEDDINGS_TABLE = os.environ.get(
 # --------------------------------------------------------------------------
 # Embedding model
 # --------------------------------------------------------------------------
+#
+# Default: a Databricks Model Serving Foundation Model API endpoint, called
+# over REST via the databricks-sdk. This is deliberate, not a stylistic
+# choice: a local sentence-transformers model pulls in torch, and torch's
+# compiled extensions are exactly the kind of thing that crashes the whole
+# Python kernel on Databricks serverless compute (SIGABRT, no catchable
+# exception) -- including Databricks Free Edition, which is serverless-only.
+# Calling a hosted endpoint keeps every native-extension dependency off this
+# process; the notebook and the app only ever exchange JSON over HTTP.
+#
+# If you're running on classic (non-serverless) compute and would rather use
+# a local model, the sentence-transformers entries below still work -- swap
+# EMBEDDING_MODEL and see embedding_pipeline.embed_texts() for the two code
+# paths.
 
-EMBEDDING_MODEL_NAME = os.environ.get(
-    "EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
-)
+EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL", "databricks-gte-large-en")
 
 # pgvector columns are declared as VECTOR(N) and N must match the model's
-# output width exactly. Rather than hardcoding 384 in five places, look the
-# dimension up from the model name so swapping models only requires changing
+# output width exactly. Rather than hardcoding the dimension in five places,
+# look it up from the model name so swapping models only requires changing
 # EMBEDDING_MODEL plus re-running the DDL.
 _MODEL_DIMENSIONS = {
+    # Databricks Foundation Model API embedding endpoints (pay-per-token,
+    # pre-configured in every workspace's Model Serving -- no deployment
+    # needed). Confirm availability under Serving in your workspace.
+    "databricks-gte-large-en": 1024,
+    "databricks-bge-large-en": 1024,
+    # Local sentence-transformers models -- only usable on classic compute,
+    # where the torch import crash above does not apply.
     "sentence-transformers/all-MiniLM-L6-v2": 384,
     "sentence-transformers/all-MiniLM-L12-v2": 384,
     "sentence-transformers/all-mpnet-base-v2": 768,
@@ -48,7 +67,7 @@ _MODEL_DIMENSIONS = {
 
 
 def embedding_dimension(model_name: str = EMBEDDING_MODEL_NAME) -> int:
-    """Return the vector width for a supported sentence-transformers model."""
+    """Return the vector width for a supported embedding model."""
     try:
         return _MODEL_DIMENSIONS[model_name]
     except KeyError:
@@ -67,9 +86,9 @@ EMBEDDING_DIM = embedding_dimension()
 # NWS narratives are short (a detailedForecast is ~200-400 characters), but a
 # combined alert description + instruction can run past 2,000 characters. An
 # 800-character window with 100 characters of overlap keeps each chunk well
-# inside the 256-token input limit of all-MiniLM-L6-v2 while making sure a
-# safety instruction that straddles a boundary still appears whole in at
-# least one chunk.
+# inside typical embedding-model input limits while making sure a safety
+# instruction that straddles a boundary still appears whole in at least one
+# chunk.
 
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "800"))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "100"))

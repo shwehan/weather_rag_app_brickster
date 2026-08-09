@@ -1,12 +1,14 @@
 -- 03_create_weather_embeddings.sql
 -- Chunk-level vector store for weather narratives.
 --
--- VECTOR(384) matches sentence-transformers/all-MiniLM-L6-v2, the model used
--- by the ingestion notebook and by the search endpoint's query encoder. If you
--- change EMBEDDING_MODEL in config.py, change the width here to match:
---   all-MiniLM-L6-v2 / all-MiniLM-L12-v2 / bge-small-en-v1.5 -> 384
---   all-mpnet-base-v2 / bge-base-en-v1.5                     -> 768
---   bge-large-en-v1.5                                        -> 1024
+-- VECTOR(1024) matches databricks-gte-large-en, the default embedding
+-- endpoint (see config.py) -- a Databricks Model Serving Foundation Model
+-- API called over REST, not a local model. If you change EMBEDDING_MODEL,
+-- change the width here to match:
+--   databricks-gte-large-en / databricks-bge-large-en           -> 1024
+--   all-MiniLM-L6-v2 / all-MiniLM-L12-v2 / bge-small-en-v1.5     -> 384
+--   all-mpnet-base-v2 / bge-base-en-v1.5                         -> 768
+--   bge-large-en-v1.5                                            -> 1024
 
 CREATE TABLE IF NOT EXISTS weather_embeddings (
     -- "<document_id>#<chunk_index>", so re-embedding a document overwrites
@@ -19,7 +21,7 @@ CREATE TABLE IF NOT EXISTS weather_embeddings (
     chunk_index   INTEGER NOT NULL,
     chunk_text    TEXT NOT NULL,
 
-    embedding     VECTOR(384) NOT NULL,
+    embedding     VECTOR(1024) NOT NULL,
 
     model_name    TEXT NOT NULL,
 

@@ -1,35 +1,57 @@
 # Databricks notebook source
-# MAGIC %md
-# MAGIC # Ingest weather narratives -> pgvector embeddings
-# MAGIC
-# MAGIC The headless version of `weather_intelligence_pipeline.ipynb`: harvest,
-# MAGIC chunk, embed, write, and print a summary. Use the `.ipynb` notebook for
-# MAGIC interactive exploration and this script for the scheduled Job (see
-# MAGIC `resources/ingest_weather_embeddings_job.yml`).
-# MAGIC
-# MAGIC It runs unchanged in three places:
-# MAGIC
-# MAGIC * as a Databricks `notebook_task`, reading Job parameters from widgets
-# MAGIC * as a Databricks `spark_python_task`, reading them from CLI flags
-# MAGIC * locally with `LAKEBASE_URL` set, for debugging
-# MAGIC
-# MAGIC Every database write goes through psycopg2 with `execute_values` and an
-# MAGIC explicit `%s::vector` cast. No Spark JDBC, no post-hoc array-to-vector
-# MAGIC conversion pass.
+"""Harvest NWS weather narratives, embed them, and load them into Lakebase.
 
-# COMMAND ----------
+The headless version of ``weather_intelligence_pipeline.ipynb``: harvest,
+chunk, embed, write, and print a summary. Use the ``.ipynb`` notebook for
+interactive exploration and this script for the scheduled Job (see
+``resources/ingest_weather_embeddings_job.yml``).
 
-# MAGIC %pip install -q --upgrade "databricks-sdk>=0.30.0" psycopg2-binary sentence-transformers requests
+It runs unchanged in three places:
 
-# COMMAND ----------
+* as a Databricks ``notebook_task``, reading Job parameters from widgets
+* as a Databricks ``spark_python_task``, reading them from CLI flags
+* locally with ``LAKEBASE_URL`` set, for debugging
 
-# dbutils.library.restartPython()   # uncomment when running as a notebook task
+Every database write goes through pg8000 -- a pure-Python Postgres driver,
+not psycopg2 -- with ``lakebase.execute_values`` and an explicit
+``%s::vector`` cast. No Spark JDBC, no post-hoc array-to-vector conversion
+pass, and no compiled C extension that could crash the kernel on serverless
+compute. Embeddings come from a Databricks Model Serving endpoint over REST
+for the same reason: no local model, no torch.
+"""
 
-# COMMAND ----------
-
-"""Harvest NWS weather narratives, embed them, and load them into Lakebase."""
-
+# `# Databricks notebook source` above must stay the literal first line of the
+# file -- it's what makes Databricks render this as a multi-cell notebook
+# rather than import it as a plain script. A module docstring and a
+# `__future__` import are both still allowed ahead of the rest of the code
+# per Python's own rules, so this ordering satisfies both constraints.
 from __future__ import annotations
+
+# COMMAND ----------
+
+# MAGIC # Every dependency here is pure Python -- no compiled C extension, no
+# MAGIC # torch. That is deliberate: packages like psycopg2 and
+# MAGIC # sentence-transformers (which pulls in torch) reliably crash the whole
+# MAGIC # kernel with a SIGABRT on Databricks serverless compute, including
+# MAGIC # Databricks Free Edition, which is serverless-only. pg8000 is a
+# MAGIC # pure-Python Postgres driver, and embeddings come from a Databricks
+# MAGIC # Model Serving endpoint called over REST rather than a local model, so
+# MAGIC # there is nothing here that can trigger that crash.
+# MAGIC %pip install -q --upgrade "databricks-sdk>=0.30.0" "pg8000>=1.31.2" requests
+
+# COMMAND ----------
+
+# The pip install above only takes effect after the Python process restarts.
+# dbutils is defined automatically when this runs as a Databricks notebook_task
+# (which is how resources/ingest_weather_embeddings_job.yml invokes it) and
+# undefined when run as a plain script -- the try/except lets one file cover
+# both without a manual edit.
+try:
+    dbutils.library.restartPython()  # noqa: F821
+except NameError:
+    pass
+
+# COMMAND ----------
 
 import argparse
 import json
@@ -44,7 +66,7 @@ import time
 DEFAULTS = {
     "documents_table": "weather_documents",
     "embeddings_table": "weather_embeddings",
-    "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+    "embedding_model": "databricks-gte-large-en",
     "locations": "Chicago, IL;Austin, TX;Denver, CO;Miami, FL;Seattle, WA",
     "sync_limit": "50",
     "chunk_size": "800",

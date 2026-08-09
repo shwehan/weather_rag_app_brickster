@@ -20,7 +20,7 @@ homework2-weather-intelligence-app/
 ├── app.py                     Flask REST API + web UI
 ├── weather_client.py          National Weather Service API client and normalizer
 ├── embedding_pipeline.py      Chunking, embedding, upserts, vector search
-├── lakebase.py                Lakebase connection helper (psycopg2)
+├── lakebase.py                Lakebase connection helper (pg8000)
 ├── config.py                  Table names, model, chunking — one source of truth
 ├── setup_secrets.py           Stores the Lakebase URL in a Databricks secret
 ├── app.yaml                   Databricks App configuration
@@ -57,6 +57,18 @@ There is no weather API key to obtain. The National Weather Service API is open;
 it only asks that clients identify themselves with a contact address in the
 `User-Agent` header.
 
+**A note on compute.** Everything in this project runs on Databricks
+serverless compute, including Databricks Free Edition (which is
+serverless-only). That's not incidental — it's why the database driver is
+`pg8000` rather than `psycopg2`, and why embeddings come from a hosted
+Databricks endpoint rather than a local `sentence-transformers` model:
+compiled C extensions (psycopg2's, torch's) reliably crash the whole Python
+kernel with a SIGABRT the moment they're imported on serverless compute. See
+[`README_WEATHER.md`](README_WEATHER.md) for the full explanation. If you're
+on classic (non-serverless) compute, neither constraint applies and you can
+swap either component back — `EMBEDDING_MODEL` in particular can point at any
+local sentence-transformers model; see `config.py`.
+
 ---
 
 ## Setup
@@ -91,7 +103,7 @@ Databricks SQL editor pointed at the instance, `psql`, or any Postgres client:
 
 1. `01_enable_pgvector.sql` — enables the `vector` extension
 2. `02_create_weather_documents.sql` — the raw document store
-3. `03_create_weather_embeddings.sql` — `VECTOR(384)` column plus an HNSW
+3. `03_create_weather_embeddings.sql` — `VECTOR(1024)` column plus an HNSW
    cosine index
 
 `02` must run before `03`, because `weather_embeddings.document_id` is a
@@ -128,8 +140,10 @@ reads `app.yaml` for the start command and environment, and `requirements.txt`
 for dependencies.
 
 Before deploying, change `NWS_USER_AGENT` in `app.yaml` to a real contact
-address, and confirm the app's service principal has read access to the
-`database` secret scope.
+address, and confirm the app's service principal has:
+- read access to the `database` secret scope
+- `CAN_QUERY` on the `databricks-gte-large-en` serving endpoint (grant it from
+  the endpoint's Permissions tab under **Serving**)
 
 With the CLI:
 
@@ -230,7 +244,9 @@ returns ranked results and notes that summaries are off.
 re-runs `notebooks/ingest_weather_embeddings.py` every 30 minutes — alerts are
 issued continuously, and a warning is not much use to a retrieval system that
 refreshes nightly. Unchanged narratives are skipped by content hash, so a quiet
-run does almost no work.
+run does almost no work. The job runs on serverless compute (no cluster spec
+at all), which is required on Databricks Free Edition and avoids paying for a
+provisioned cluster to sit idle between runs anyway.
 
 ```bash
 databricks bundle deploy -t dev
@@ -246,11 +262,13 @@ The schedule ships paused. Unpause it after a successful manual run.
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env      # set LAKEBASE_URL and NWS_USER_AGENT
+cp .env.example .env      # set LAKEBASE_URL, NWS_USER_AGENT, DATABRICKS_HOST, DATABRICKS_TOKEN
 export $(grep -v '^#' .env | xargs)
 python app.py             # http://localhost:8000
 ```
 
-Local runs read `LAKEBASE_URL` from the environment and skip the Databricks
-secret lookup entirely, so no workspace authentication is needed as long as the
-Lakebase instance accepts connections from your network.
+`DATABRICKS_HOST`/`DATABRICKS_TOKEN` are needed even for local runs: embeddings
+come from a Databricks-hosted endpoint over REST rather than a local model, so
+the process authenticates to your workspace to call it. Skip both if you
+already have a working `databricks auth login` profile or a populated
+`~/.databrickscfg` — the SDK picks those up automatically.

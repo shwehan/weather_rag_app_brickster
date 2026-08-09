@@ -25,10 +25,8 @@ from __future__ import annotations
 
 import logging
 import os
-import threading
 
 import requests
-from psycopg2 import errors as pg_errors
 from flask import Flask, jsonify, render_template, request
 
 import config
@@ -53,25 +51,11 @@ _SETUP_HINT = (
     "weather_documents and weather_embeddings before using this endpoint."
 )
 
-
-def _preload_model() -> None:
-    """Warm the sentence-transformers model once, off the request path.
-
-    The model is loaded exactly once per process. Doing it on a background
-    thread at startup means the first search is fast without delaying the
-    health check while the weights download.
-    """
-    try:
-        embedding_pipeline.get_model()
-        logger.info("Embedding model ready: %s", config.EMBEDDING_MODEL_NAME)
-    except Exception:
-        # A cold model is not fatal -- the first search will retry the load
-        # and surface any real problem to the caller.
-        logger.exception("Could not preload the embedding model at startup")
-
-
-if os.environ.get("PRELOAD_EMBEDDING_MODEL", "true").lower() != "false":
-    threading.Thread(target=_preload_model, daemon=True).start()
+# Undefined-table is SQLSTATE 42P01. Embeddings come from a hosted Databricks
+# endpoint rather than a local model, so there's no equivalent warm-up step
+# needed at startup -- every search is just an HTTP call, cheap from the
+# first request onward.
+_UNDEFINED_TABLE = "42P01"
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +70,7 @@ def handle_exception(err):
     if not isinstance(status, int):
         status = 500
 
-    if isinstance(err, pg_errors.UndefinedTable):
+    if isinstance(err, lakebase.DatabaseError) and lakebase.sqlstate(err) == _UNDEFINED_TABLE:
         return jsonify({"error": "Table not found. " + _SETUP_HINT}), 503
 
     logger.exception("Unhandled error while processing %s", request.path)

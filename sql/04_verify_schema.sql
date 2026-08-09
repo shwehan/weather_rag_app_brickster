@@ -12,7 +12,7 @@ FROM pg_attribute a
 JOIN pg_class c ON c.oid = a.attrelid
 WHERE c.relname = 'weather_embeddings'
   AND a.attname = 'embedding';
--- Expect: vector(384)
+-- Expect: vector(1024)
 
 -- 2. Row counts and coverage.
 SELECT
@@ -58,7 +58,7 @@ SELECT indexname, indexdef
 FROM pg_indexes
 WHERE tablename = 'weather_embeddings';
 
--- Replace the literal below with any 384-dimension vector, e.g. copy one
+-- Replace the literal below with any 1024-dimension vector, e.g. copy one
 -- straight out of the table:
 --   SELECT embedding FROM weather_embeddings LIMIT 1;
 --

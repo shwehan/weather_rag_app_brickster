@@ -9,6 +9,14 @@
 # The app's service principal needs READ on the "database" secret scope. Grant
 # it with setup_secrets.py, or:
 #   databricks secrets put-acl database <app-service-principal> READ
+#
+# It also needs CAN_QUERY on the databricks-gte-large-en serving endpoint
+# (Foundation Model API endpoints are pre-configured but still permissioned
+# per-principal). Grant it from the endpoint's Permissions tab under Serving,
+# or:
+#   databricks serving-endpoints http-request \
+#       --method PUT --path /api/2.0/permissions/serving-endpoints/<endpoint-id> \
+#       --json '{"access_control_list":[{"service_principal_name":"<app-service-principal>","permission_level":"CAN_QUERY"}]}'
 
 command:
   - "python"
@@ -33,19 +41,17 @@ env:
   - name: WEATHER_EMBEDDINGS_TABLE
     value: "weather_embeddings"
 
-  # Embedding model and chunking. Changing the model means changing the
-  # VECTOR(N) width in sql/03_create_weather_embeddings.sql to match.
+  # Embedding model and chunking. databricks-gte-large-en (1024-dim) is a
+  # pre-configured Foundation Model API endpoint called over REST -- no local
+  # model, no torch, nothing that could crash the app's serverless compute.
+  # Changing the model means changing the VECTOR(N) width in
+  # sql/03_create_weather_embeddings.sql to match.
   - name: EMBEDDING_MODEL
-    value: "sentence-transformers/all-MiniLM-L6-v2"
+    value: "databricks-gte-large-en"
   - name: CHUNK_SIZE
     value: "800"
   - name: CHUNK_OVERLAP
     value: "100"
-
-  # Load the embedding model on a background thread at startup so the first
-  # search does not pay for it. Set to "false" on a memory-constrained app.
-  - name: PRELOAD_EMBEDDING_MODEL
-    value: "true"
 
   # Locations used when POST /weather/sync is called with no body.
   - name: WEATHER_LOCATIONS

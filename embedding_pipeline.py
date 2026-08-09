@@ -7,60 +7,54 @@ notebook, and the scheduled Job. Whatever you validate in the notebook is what
 the web UI executes.
 
 Write path
-    documents -> chunks -> vectors -> ``weather_embeddings`` (psycopg2 +
-    ``execute_values``, cast to pgvector's ``VECTOR`` type with ``%s::vector``)
+    documents -> chunks -> vectors -> ``weather_embeddings`` (pg8000 +
+    ``lakebase.execute_values``, cast to pgvector's ``VECTOR`` type with
+    ``%s::vector``)
 
 Read path
     query -> vector -> cosine distance with pgvector's ``<=>`` operator,
     joined back to ``weather_documents`` for display fields.
+
+Embeddings come from a Databricks Model Serving Foundation Model API endpoint
+(``databricks-gte-large-en`` by default) called over REST, rather than a local
+``sentence-transformers`` model. That's deliberate: ``sentence-transformers``
+pulls in ``torch``, and loading torch's compiled extensions is exactly the
+kind of thing that crashes the kernel on Databricks serverless compute
+(including Free Edition, which is serverless-only) with a SIGABRT. Calling a
+hosted endpoint keeps every heavy, native-extension-laden dependency off this
+process entirely -- the notebook and the app only ever send and receive JSON.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import threading
+from functools import lru_cache
 from typing import Any, Iterable, Sequence
-
-from psycopg2.extras import execute_values
 
 import config
 import lakebase
 
 logger = logging.getLogger(__name__)
 
-_model_lock = threading.Lock()
-_model_cache: dict[str, Any] = {}
+execute_values = lakebase.execute_values
 
 
 # ---------------------------------------------------------------------------
-# Model handling
+# Embedding client
 # ---------------------------------------------------------------------------
 
 
-def get_model(model_name: str = config.EMBEDDING_MODEL_NAME):
-    """Load a sentence-transformers model once per process and reuse it.
+@lru_cache(maxsize=1)
+def _workspace_client():
+    """A single, lazily-created WorkspaceClient, reused across calls.
 
-    Loading MiniLM takes a few seconds and ~90 MB of RAM, so the web app must
-    never do it inside a request handler. The first caller pays the cost, and
-    every later query -- including every ``POST /weather/search`` -- reuses the
-    warm instance behind a lock so two simultaneous first-requests cannot race.
+    ``databricks-sdk`` is pure Python, so creating this client never risks the
+    native-extension crash that a local embedding model would.
     """
-    cached = _model_cache.get(model_name)
-    if cached is not None:
-        return cached
+    from databricks.sdk import WorkspaceClient
 
-    with _model_lock:
-        cached = _model_cache.get(model_name)
-        if cached is not None:
-            return cached
-
-        from sentence_transformers import SentenceTransformer
-
-        logger.info("Loading embedding model %s", model_name)
-        model = SentenceTransformer(model_name)
-        _model_cache[model_name] = model
-        return model
+    return WorkspaceClient()
 
 
 def embed_texts(
@@ -68,14 +62,27 @@ def embed_texts(
     model_name: str = config.EMBEDDING_MODEL_NAME,
     batch_size: int = 32,
 ) -> list[list[float]]:
-    """Embed a list of strings and return plain Python float lists."""
+    """Embed a list of strings via the Databricks embedding endpoint.
+
+    Batches requests so that embedding a few hundred chunks is a handful of
+    HTTP calls rather than one per chunk. The endpoint's response items carry
+    an ``index`` matching the input order; results are sorted on it rather
+    than trusted to arrive in order, since that's cheap insurance against a
+    provider that batches or retries out of order.
+    """
     if not texts:
         return []
-    model = get_model(model_name)
-    vectors = model.encode(
-        list(texts), batch_size=batch_size, show_progress_bar=False
-    )
-    return [[float(value) for value in vector] for vector in vectors]
+
+    client = _workspace_client()
+    vectors: list[list[float]] = []
+
+    for start in range(0, len(texts), batch_size):
+        batch = list(texts[start : start + batch_size])
+        response = client.serving_endpoints.query(name=model_name, input=batch)
+        items = sorted(response.data, key=lambda item: item.index)
+        vectors.extend([float(v) for v in item.embedding] for item in items)
+
+    return vectors
 
 
 def to_vector_literal(vector: Sequence[float]) -> str:
@@ -182,9 +189,12 @@ def upsert_documents(documents: Iterable[dict], page_size: int = 100) -> int:
     template = "(" + ", ".join(["%s"] * len(_DOCUMENT_COLUMNS)) + ", now())"
 
     with lakebase.get_connection() as conn:
-        with conn.cursor() as cur:
+        cur = conn.cursor()
+        try:
             execute_values(cur, sql, rows, template=template, page_size=page_size)
             conn.commit()
+        finally:
+            cur.close()
     return len(rows)
 
 
@@ -266,9 +276,12 @@ def write_embeddings(rows: Sequence[dict], page_size: int = 100) -> int:
     template = "(%s, %s, %s, %s, %s::vector, %s, %s, now())"
 
     with lakebase.get_connection() as conn:
-        with conn.cursor() as cur:
+        cur = conn.cursor()
+        try:
             execute_values(cur, sql, values, template=template, page_size=page_size)
             conn.commit()
+        finally:
+            cur.close()
     return len(values)
 
 

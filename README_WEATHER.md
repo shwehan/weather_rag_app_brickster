@@ -100,7 +100,7 @@ One row per chunk.
 | `id` | `<document_id>#<chunk_index>` — re-embedding overwrites a document's own chunks instead of duplicating them |
 | `document_id` | FK to `weather_documents(id)` with `ON DELETE CASCADE`, so purging a document takes its vectors with it |
 | `chunk_index`, `chunk_text` | Position and the exact text that produced the vector, so results can show what actually matched |
-| `embedding` | `VECTOR(384)` |
+| `embedding` | `VECTOR(1024)` |
 | `model_name` | Which model produced it, so two models can coexist during a migration |
 | `content_hash` | Copied from the document at embed time; a mismatch marks the vector stale |
 | `created_at` | Embed time |
@@ -125,17 +125,31 @@ call per location and no GPU-equivalent work at all.
 
 ## Embedding model and chunking
 
-**Model:** `sentence-transformers/all-MiniLM-L6-v2`, 384 dimensions.
+**Model:** `databricks-gte-large-en`, 1024 dimensions, called over REST via a
+Databricks Model Serving Foundation Model API endpoint — not a local
+`sentence-transformers` model.
 
-Small, fast on CPU, and strong on short-passage retrieval — which is the whole
-workload here, since weather narratives are paragraphs rather than documents. It
-also keeps the app's memory footprint low enough to run comfortably in a
-Databricks App, and shares the distance-operator conventions used elsewhere in
-the course, so vectors stay queryable with the same `<=>` cosine operator.
+That's a deliberate substitution, not a style preference, and it's worth
+explaining plainly since the original design used a local MiniLM model. A
+local `sentence-transformers` model pulls in `torch`, and `torch`'s compiled
+extensions reliably crash the whole Python kernel with a SIGABRT the instant
+they're imported on Databricks serverless compute — including Databricks Free
+Edition, which is serverless-only. It's a documented pattern on serverless
+generally (other C-extension-heavy packages hit the identical symptom there),
+not something fixable by editing the importing cell. Calling a hosted
+endpoint keeps every native-extension dependency off the process entirely:
+the notebook and the app only ever exchange JSON over HTTP. `gte-large-en` is
+pre-configured pay-per-token in every workspace's Model Serving, needs no
+deployment of your own, and produces embeddings strong enough for
+short-passage retrieval — the whole workload here, since weather narratives
+are paragraphs rather than documents.
 
-`config.py` maps model names to dimensions and raises a clear error on an unknown
-one, so switching models is a two-line change plus a matching `VECTOR(N)` width
-in `sql/03_create_weather_embeddings.sql`.
+`config.py` maps model names to dimensions and raises a clear error on an
+unknown one, so switching models is a two-line change plus a matching
+`VECTOR(N)` width in `sql/03_create_weather_embeddings.sql`. On classic
+(non-serverless) compute, where the crash above doesn't apply, the
+sentence-transformers entries already in that map work as drop-in
+alternatives.
 
 **Chunking:** 800 characters, 100 characters of overlap.
 
@@ -148,12 +162,13 @@ Sizing was driven by what the source actually produces:
 | Alert description + instruction | 800–2,500 characters | 1–4 |
 
 So chunking is a no-op for most forecasts and matters mainly for long alert
-bodies. 800 characters is roughly 180 tokens, comfortably inside MiniLM's
-256-token input window — a larger window would silently truncate, which is worse
-than splitting because the loss is invisible. The 100-character overlap keeps a
-sentence that straddles a boundary intact in at least one chunk; that is about
-one sentence of weather prose, enough to preserve a protective-action line that
-would otherwise be cut in half.
+bodies. 800 characters comfortably clears `gte-large-en`'s per-chunk needs
+without padding requests — a larger window would just mean fewer, larger
+chunks with less precise matches, since a hit returns the whole chunk as
+context. The 100-character overlap keeps a sentence that straddles a boundary
+intact in at least one chunk; that is about one sentence of weather prose,
+enough to preserve a protective-action line that would otherwise be cut in
+half.
 
 Chunks are stored individually and retrieval returns the matching chunk
 alongside its parent document, so a hit shows both the specific passage that
@@ -163,18 +178,32 @@ matched and the full context it came from.
 
 ## Writes
 
-Everything goes through **psycopg2**, using `execute_values` for batching and an
-explicit `%s::vector` cast for embeddings.
+Everything goes through **pg8000** — a pure-Python Postgres driver, not
+psycopg2 — using a small `execute_values` replacement (`lakebase.execute_values`)
+for batching and an explicit `%s::vector` cast for embeddings.
 
-This is deliberate. Spark JDBC has no mapping for pgvector's `VECTOR` type and no
-`ON CONFLICT` support, which forces a `float8[]` staging column and a follow-up
-`UPDATE … ::vector` pass — a step that is easy to forget and leaves the index
-silently unbuilt when you do. Casting at insert time means the column holds real
-vectors the moment the row lands, and `ON CONFLICT` makes every write idempotent.
+Two separate decisions are bundled into "pg8000, not psycopg2 or Spark JDBC,"
+and it's worth untangling them:
 
-The workload does not need distribution anyway: harvesting is network-bound, and
-embedding a few thousand short chunks with MiniLM takes seconds on a single node.
-The scheduled Job runs on a single-node cluster for exactly this reason.
+- **Not Spark JDBC**, because it has no mapping for pgvector's `VECTOR` type
+  and no `ON CONFLICT` support, which forces a `float8[]` staging column and a
+  follow-up `UPDATE … ::vector` pass — a step that is easy to forget and
+  leaves the index silently unbuilt when you do. Casting at insert time means
+  the column holds real vectors the moment the row lands, and `ON CONFLICT`
+  makes every write idempotent.
+- **Not psycopg2**, because its compiled C extension is the other package
+  (alongside torch) that reliably crashes the kernel on Databricks serverless
+  compute with a SIGABRT on import. pg8000 speaks the Postgres wire protocol
+  directly in Python — no compiled extension, nothing to conflict with a
+  system library the serverless container doesn't ship. Both drivers use the
+  same DB-API `%s` placeholder style, so this swap changed zero SQL in the
+  project; only `lakebase.py`'s connection-handling internals changed.
+
+The workload does not need distribution anyway: harvesting is network-bound,
+and embedding a few thousand short chunks via a hosted endpoint takes seconds
+regardless of which node it runs on. The scheduled Job runs on serverless
+compute for exactly this reason — no cluster to provision or leave idle
+between 30-minute runs.
 
 ---
 
@@ -196,6 +225,13 @@ all three as a linear demo; the scheduled Job does the first two headlessly.
 ---
 
 ## Limitations, and what I would do with more time
+
+**Embedding costs money past the free quota.** `databricks-gte-large-en` is
+pay-per-token; a demo-sized corpus (a few hundred documents) costs pennies,
+but it's not literally free the way a local model's compute is. There is no
+usage cap in this project — a runaway sync loop would keep incurring charges.
+A production version should track token spend or wrap the embed step in a
+budget check.
 
 **Alerts are sparse by design.** On a calm day a location has zero active alerts,
 so a demo may end up with forecasts only. Retrieval still works, but the
